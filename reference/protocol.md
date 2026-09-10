@@ -22,6 +22,8 @@ GET https://backend.leadconnectorhq.com/workflow/{locationId}/list?parentId=root
 
 Headers as the script sends them: `token-id: <token>`, `channel: APP`, `source: WEB_USER`, `version: 2021-04-15`.
 
+Where the token comes from: in a browser logged into GHL, DevTools, Network tab, any request to `backend.leadconnectorhq.com`. The sub-account's Settings, Custom Fields page reliably fires `GET https://backend.leadconnectorhq.com/locations/<locationId>/customFields/search?parentId=&skip=0&limit=10000&documentType=field&model=all&query=&includeStandards=true`; its Request Headers carry the `token-id` value the script needs. The same value is what the detail hop sends as `authorization: Bearer`.
+
 The response has `rows[]`, each row carrying `type`, `id` and `name`. The root list is mostly **directories**, so a flat read of the root under-counts badly and every later count in your deliverable would be wrong. Recurse into each row with `type == "directory"` (or `"folder"`) using `parentId=<directoryId>` until you have every row with `type == "workflow"`.
 
 **Paging.** The script requests `limit=500&offset=0` per folder and does not page beyond that single page. If a folder returns exactly 500 rows, assume there may be more: record the row count per folder, treat the total as possibly truncated, check that folder in the GHL UI, report it in the deliverable's Gaps section rather than as fact, and ask the script's owner for paging (an `offset` walk) before mapping an account that large.

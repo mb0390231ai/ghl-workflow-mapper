@@ -18,15 +18,13 @@ Read-only by construction: every network call the tool makes is an HTTP GET. It 
 |---|---|---|
 | **Claude Code** (CLI, or the Code tab in the Claude desktop app) | Supported | Local shell and Python, macOS keychain for the token, local snapshot files, diagram published as an artifact. If you have the Bash sandbox enabled, allowlist `backend.leadconnectorhq.com` and `firebasestorage.googleapis.com` and exclude the `security` command. |
 | Other coding agents with a shell and Python 3.8+ (Cursor, Codex CLI, and similar) | Should work | Same requirements. The diagram is written as a Markdown file with a Mermaid fence, which renders in GitHub, VS Code, Obsidian and Notion. |
-| **Claude Cowork** | Not supported as written | Cowork runs scripts in an isolated Linux VM: no macOS keychain, outbound domains are controlled by your organization's code-execution allowlist, and skills load from your account's Customize settings rather than `.claude/skills`. It could be made to work by allowlisting the two hosts, supplying the token through an environment variable or a file in a connected folder, and installing the skill through Customize. |
-| claude.ai chat, ChatGPT, other chat-only assistants | Not supported | No shell, no filesystem, no way to run the tool. |
 
 ## Install
 
 From the root of the folder you want to work in (a scratch repo is fine):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-account>/ghl-workflow-mapper/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mb0390231ai/ghl-workflow-mapper/main/install.sh | bash
 ```
 
 or copy the four files by hand into `.claude/skills/ghl-workflow-mapper/`:
@@ -47,9 +45,9 @@ Then add `.ghl-workflow-snapshots/` to that folder's `.gitignore`. The snapshots
 
 Open Claude Code in that folder and paste:
 
-> Use the ghl-workflow-mapper skill. Before your first network call, read me the skill's read-only note and terms note in plain words and wait for my explicit yes, then record who accepted and when. Walk me through getting the token one step at a time. Account: `<location id>`; read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.
+> Use the ghl-workflow-mapper skill. Before your first network call, read me the skill's read-only note and terms note in plain words and wait for my explicit yes, then record who accepted and when. I will need to give you two things and I do not know where to find them, so guide me step by step: first the location id of the sub-account (tell me where it sits in the GHL address bar and wait for me to paste it), then the session token (tell me exactly where to click in the browser DevTools and wait for me to confirm it is stored). Read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.
 
-The agent will explain what it is about to do and what it needs from you (about two minutes in your browser's DevTools to copy a session token, which expires after an hour), download the workflow definitions, and show you the diagram. After that, ask it anything: "what does the Booking Confirmation workflow actually do", "which workflows would break if I disabled this one", "audit these for hidden problems".
+The agent will explain what it is about to do and what it needs from you (the sub-account's location id from the address bar, and about two minutes in your browser's DevTools to copy a session token from a request to backend.leadconnectorhq.com, which expires after an hour), download the workflow definitions, and show you the diagram. After that, ask it anything: "what does the Booking Confirmation workflow actually do", "which workflows would break if I disabled this one", "audit these for hidden problems".
 
 ## Before you run it
 

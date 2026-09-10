@@ -6,7 +6,7 @@ mkdir -p "$ROOT/reference" "$ROOT/scripts"
 cat > "$ROOT/SKILL.md" <<'GHL_MAPPER_EOF'
 ---
 name: ghl-workflow-mapper
-description: Maps the real internals of every GoHighLevel (GHL / LeadConnector) workflow in a sub-account: triggers, branch conditions, waits, custom-field reads and writes, tags, webhooks and pipeline-stage moves, none of which the public API or the GHL MCP server exposes. Read-only, through the same requests the browser makes when the workflow builder is open. First produces a dependency diagram of how the workflows trigger, add to, remove from and gate each other; then answers questions about them and audits for hidden problems on request. Use when an agency needs to see how its GHL automations fit together, know which workflows touch a process before changing or disabling it, find out why a workflow does or does not fire, or check which custom fields and custom values an automation chain depends on.
+description: "Maps the real internals of every GoHighLevel (GHL / LeadConnector) workflow in a sub-account: triggers, branch conditions, waits, custom-field reads and writes, tags, webhooks and pipeline-stage moves, none of which the public API or the GHL MCP server exposes. Read-only, through the same requests the browser makes when the workflow builder is open. First produces a dependency diagram of how the workflows trigger, add to, remove from and gate each other; then answers questions about them and audits for hidden problems on request. Use when an agency needs to see how its GHL automations fit together, know which workflows touch a process before changing or disabling it, find out why a workflow does or does not fire, or check which custom fields and custom values an automation chain depends on."
 ---
 
 # GoHighLevel workflow mapper
@@ -73,9 +73,9 @@ Guardrail 2, before anything touches the network. Say what the tool does (reads 
 
 **Pick the account.** If the agency keeps a template sub-account that new clients are cloned from, map that first: it is the source of truth for every clone. Map an individual client sub-account only when the owner named it (guardrail 7, checkpoint 2).
 
-**Get the location id.** It is the id in the GHL URL after `/location/`.
+**Get the location id.** Ask the owner to open the sub-account in GHL and read the browser address bar: the URL looks like `https://app.gohighlevel.com/v2/location/<locationId>/...` (agencies on a white-labelled domain see their own domain, then `/v2/location/`). The string between `/location/` and the next `/` is the location id, about 20 letters and digits. Ask them to copy it and paste it into the chat; confirm it back before you use it.
 
-**Get a token.** The owner does this in about two minutes; walk them through it one step at a time. In a browser logged into GHL: open DevTools (F12, or right-click, Inspect), select the Network tab, reload the page, click any request whose name or domain contains `backend.leadconnectorhq.com`, find the **Request Headers** section, and copy the full value of the `token-id` header. It is a long string starting `eyJ`, roughly a thousand characters. It expires in about **one hour**.
+**Get a token.** The owner does this in about two minutes; walk them through it one step at a time. In a browser logged into GHL: open DevTools (F12, or right-click the page and choose Inspect), select the **Network** tab, then open the sub-account's **Settings, Custom Fields** page (or reload any GHL page). Requests to `backend.leadconnectorhq.com` appear in the list; the Custom Fields page reliably fires one named `search?parentId=...` whose full URL is `https://backend.leadconnectorhq.com/locations/<locationId>/customFields/search?...`, and any request to that host works. Click it, open the **Headers** panel, scroll to **Request Headers**, and copy the full value of the `token-id` header (right-click the value, Copy value). It is a long string starting `eyJ`, roughly a thousand characters. It expires in about **one hour**.
 
 Treat a 401 on a call that worked earlier as token expiry first: ask for a fresh one before you debug anything else. If a fresh token also 401s, stop and suspect the header form (the list endpoint wants `token-id`, the detail endpoint wants `authorization: Bearer`, same value, per `reference/protocol.md`).
 
@@ -171,7 +171,7 @@ Snapshots go stale the moment someone edits a workflow. To refresh: fresh token,
 
 ## Starter prompt
 
-> Use the ghl-workflow-mapper skill. Before your first network call, read me the skill's read-only note and terms note in plain words and wait for my explicit yes, then record who accepted and when. Walk me through getting the token one step at a time. Account: `<location id>`; read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.
+> Use the ghl-workflow-mapper skill. Before your first network call, read me the skill's read-only note and terms note in plain words and wait for my explicit yes, then record who accepted and when. I will need to give you two things and I do not know where to find them, so guide me step by step: first the location id of the sub-account (tell me where it sits in the GHL address bar and wait for me to paste it), then the session token (tell me exactly where to click in the browser DevTools and wait for me to confirm it is stored). Read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.
 GHL_MAPPER_EOF
 cat > "$ROOT/reference/protocol.md" <<'GHL_MAPPER_EOF'
 # GHL internal workflow API: protocol reference
@@ -197,6 +197,8 @@ GET https://backend.leadconnectorhq.com/workflow/{locationId}/list?parentId=root
 ```
 
 Headers as the script sends them: `token-id: <token>`, `channel: APP`, `source: WEB_USER`, `version: 2021-04-15`.
+
+Where the token comes from: in a browser logged into GHL, DevTools, Network tab, any request to `backend.leadconnectorhq.com`. The sub-account's Settings, Custom Fields page reliably fires `GET https://backend.leadconnectorhq.com/locations/<locationId>/customFields/search?parentId=&skip=0&limit=10000&documentType=field&model=all&query=&includeStandards=true`; its Request Headers carry the `token-id` value the script needs. The same value is what the detail hop sends as `authorization: Bearer`.
 
 The response has `rows[]`, each row carrying `type`, `id` and `name`. The root list is mostly **directories**, so a flat read of the root under-counts badly and every later count in your deliverable would be wrong. Recurse into each row with `type == "directory"` (or `"folder"`) using `parentId=<directoryId>` until you have every row with `type == "workflow"`.
 
