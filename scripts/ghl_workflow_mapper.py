@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """ghl_workflow_mapper.py - read-only mapper for GoHighLevel workflow internals.
 
+The skill runs every network step through scripts/bash/harvest_workflows.sh and
+uses this tool for the diagram and the offline analysis of the saved snapshots.
+
 READ-ONLY BY CONSTRUCTION: every network call is an HTTP GET, sent through the
 system curl (GHL's edge refuses Python's built-in HTTP client). Do not add a write.
 
@@ -128,7 +131,7 @@ def list_headers(tok):
     return {"token-id": tok, "channel": "APP", "source": "WEB_USER", "version": "2021-04-15"}
 
 def detail_headers(tok):
-    return {"authorization": f"Bearer {tok}", "channel": "APP", "source": "WEB_USER",
+    return {"token-id": tok, "authorization": f"Bearer {tok}", "channel": "APP", "source": "WEB_USER",
             "origin": "https://client-app-automation-workflows.leadconnectorhq.com",
             "referer": "https://client-app-automation-workflows.leadconnectorhq.com/"}
 

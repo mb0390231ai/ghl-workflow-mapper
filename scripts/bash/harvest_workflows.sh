@@ -3,10 +3,10 @@
 # sub-account, using the same read-only requests the workflow builder makes.
 #
 # NOTE
-#   Original bash implementation. The single-file Python tool
-#   `ghl_workflow_mapper.py` in this repo supersedes it and adds the `diagram`
-#   mode; this version is kept for people who prefer bash + jq-free python
-#   heredocs.
+#   The skill runs every network step (probe, tree, harvest, harvest-triggers)
+#   through this script. The Python tool `ghl_workflow_mapper.py` in this repo
+#   draws the `diagram` and runs the offline analysis from the snapshots saved
+#   here.
 #
 # WHY THIS EXISTS
 #   GHL's public API v2 exposes workflow metadata only (id/name/status/version):
@@ -32,13 +32,16 @@
 #
 #     security add-generic-password -U -a "$USER" -s GHL_TOKEN_ID -w "$(pbpaste)"
 #
+#   On Linux the token is read from libsecret (secret-tool, service GHL_TOKEN_ID);
+#   a GHL_TOKEN_ID environment variable, if set, is read first.
+#
 #   Tokens last ~1 hour. Re-copy from DevTools (Network tab, any
 #   backend.leadconnectorhq.com request, Request Headers -> token-id) and re-run
 #   that command when calls start returning 401.
 #
 # USAGE
 #   NETWORK MODES (GET only)
-#     probe            <locationId>                  # 3 calls, verifies access
+#     probe            <locationId>                  # list, detail, graph, triggers
 #     tree             <locationId>                  # enumerate workflows only
 #     harvest          <locationId> [<workflowId> ...]  # detail + graph -> OUT_DIR
 #     harvest-triggers <locationId> [<workflowId> ...]  # builder's trigger list -> <workflowId>.triggers.json
@@ -57,7 +60,7 @@
 #     triggers    <locationId> [<workflowId>]       # harvested trigger definitions
 #     summary     <locationId>                      # which workflows move stages
 #
-#   OUT_DIR defaults to .ghl-workflow-snapshots/<locationId>/ (gitignore it).
+#   OUT_DIR (or GHL_SNAPSHOT_DIR) defaults to .ghl-workflow-snapshots/<locationId>/.
 #   Snapshots are plain JSON so successive runs can be diffed for workflow
 #   drift across the fleet.
 #
@@ -68,7 +71,7 @@ set -euo pipefail
 
 BASE="https://backend.leadconnectorhq.com/workflow"
 SLEEP_BETWEEN=1          # seconds; be a polite client, no documented rate limit
-OUT_DIR="${OUT_DIR:-.ghl-workflow-snapshots}"
+OUT_DIR="${OUT_DIR:-${GHL_SNAPSHOT_DIR:-.ghl-workflow-snapshots}}"
 # Shared python helpers (wf_lib.py) live next to this script; the analysis modes
 # pass this path as argv[1] to their heredocs and import from it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,13 +81,20 @@ LOC="${2:-}"
 WF_OVERRIDE="${3:-}"   # workflow id (inspect*/flow/triggers) or first flag/type arg
 
 if [[ -z "$MODE" || -z "$LOC" ]]; then
-  sed -n '2,66p' "$0"
+  sed -n '2,69p' "$0"
   exit 64
 fi
 
-TOKEN="$(security find-generic-password -a "$USER" -s GHL_TOKEN_ID -w 2>/dev/null || true)"
+# Token: GHL_TOKEN_ID from the environment, else the macOS keychain, else libsecret.
+TOKEN="${GHL_TOKEN_ID:-}"
 if [[ -z "$TOKEN" ]]; then
-  echo "ERROR: keychain item GHL_TOKEN_ID not found. See the AUTH section in this script." >&2
+  TOKEN="$(security find-generic-password -a "$USER" -s GHL_TOKEN_ID -w 2>/dev/null || true)"
+fi
+if [[ -z "$TOKEN" ]]; then
+  TOKEN="$(secret-tool lookup service GHL_TOKEN_ID 2>/dev/null || true)"
+fi
+if [[ -z "$TOKEN" ]]; then
+  echo "ERROR: no token. Store it as GHL_TOKEN_ID in the OS secret store (see the AUTH section in this script)." >&2
   exit 3
 fi
 # Minutes until the token's exp claim, read locally from the JWT (no network call).
@@ -118,7 +128,7 @@ FULL_HEADERS=(-H "channel: APP" -H "source: WEB_USER" -H "version: 2021-04-15" -
 # token-id) and is called from the automation-builder origin. GHL_BEARER, if
 # present in the keychain, is used here; otherwise the token-id value is tried
 # as a Bearer (works only if GHL issues one JWT for both).
-BEARER="$(security find-generic-password -a "$USER" -s GHL_BEARER -w 2>/dev/null || printf '%s' "$TOKEN")"
+BEARER="${GHL_BEARER:-$(security find-generic-password -a "$USER" -s GHL_BEARER -w 2>/dev/null || printf '%s' "$TOKEN")}"
 DETAIL_HEADERS=(
   -H "authorization: Bearer ${BEARER}"
   -H "channel: APP"
@@ -253,6 +263,12 @@ kinds = Counter((s.get("type") or s.get("actionType") or "?") for s in steps if 
 for k, n in kinds.most_common():
     print(f"    {k}: {n}")
 PY
+        echo
+        echo "  --- hop 3: this workflow's triggers (the builder's trigger endpoint) ---"
+        sleep "$SLEEP_BETWEEN"
+        tmp_trig="$(mktemp)"
+        tcode="$(ghl_get "${BASE}/${LOC}/trigger?workflowId=${wf_id}" "$tmp_trig" "${DETAIL_HEADERS[@]}")"
+        echo "  [$tcode] triggers: $(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from wf_lib import load_json, trigger_list; d = load_json(sys.argv[2]); print("not JSON" if d is None else str(len(trigger_list(d))) + " trigger(s)")' "$SCRIPT_DIR" "$tmp_trig")"
         echo
         echo "  GRAPH REACHED: full workflow internals are available."
         echo "  detail: $tmp_wf   graph: $tmp_graph"

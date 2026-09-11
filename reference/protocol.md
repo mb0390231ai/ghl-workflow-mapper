@@ -1,6 +1,6 @@
 # GHL internal workflow API: protocol reference
 
-Read this when a call fails, when the JSON shape looks new, or when you are adding a mode to `scripts/ghl_workflow_mapper.py`. Every request described here is a GET. The script implements all of it; this file exists so you can debug and extend it without reading 745 lines of Python.
+Read this when a call fails, when the JSON shape looks new, or when you are adding a mode. Every request described here is a GET, and the skill sends all of them through `scripts/bash/harvest_workflows.sh`; this file exists so you can debug and extend it without reading the script.
 
 ## Contents
 
@@ -36,7 +36,7 @@ GET https://backend.leadconnectorhq.com/workflow/{locationId}/{workflowId}?inclu
 
 Headers: `authorization: Bearer <same token>`, `channel: APP`, `source: WEB_USER`, `origin: https://client-app-automation-workflows.leadconnectorhq.com`, `referer: https://client-app-automation-workflows.leadconnectorhq.com/`. The `origin` and `referer` are the GHL automation builder app host, and the script also sends the API `version` header it was written against. If the detail endpoint starts rejecting these, do not guess new header values: open DevTools on a working builder page, read the request headers GHL itself sends now, and report the difference before changing anything.
 
-The list endpoint wants the token in `token-id`; the detail endpoint wants it as `Bearer`. Same value, different header. This is the single most common cause of a 401 on a token that is actually fine.
+The list endpoint wants the token in `token-id`; the detail and trigger endpoints want it as `Bearer` as well. Same value, different header. The harvester sends `token-id` on every request and adds `Bearer` on the detail and trigger hops; a detail request carrying `Bearer` alone was refused with 401 in September 2026. A missing header is the single most common cause of a 401 on a token that is actually fine.
 
 Response fields you need: `name`, `status` (published or draft), `dataVersion`, `fileUrl` (a signed Firebase Storage URL holding the step graph). `triggersFilePath` and `isTriggerBucketMigrated` may also appear; ignore them and read triggers from their own endpoint (next section).
 
@@ -121,6 +121,6 @@ Contact custom-field **values**, meaning what a human actually typed into a cont
 
 ## Extending the script
 
-Run `python3 scripts/ghl_workflow_mapper.py` with no arguments to print the full mode list and flags. That usage text is the authority on modes and flags; where it and a document disagree, follow it and say so in your report.
+Run either script with no arguments (`bash scripts/bash/harvest_workflows.sh` for the network modes, `python3 scripts/ghl_workflow_mapper.py` for the offline ones) to print its modes and flags. That usage text is the authority on modes and flags; where it and a document disagree, follow it and say so in your report.
 
-Extend it by adding a mode, never by adding a write. A new mode must reach the network only through the existing GET helper, which cannot send another method, and must print only through the existing redaction helpers, so URLs collapse to hostnames, free text truncates, and webhook headers and token-like keys blank out. Before you run a new mode on real data, run it once and read its output for anything that looks like a secret, a full URL with a query string, or a message body. The script needs Python 3.8+ and the standard library only: no curl, no packages.
+Extend it by adding a mode, never by adding a write. A new mode must reach the network only through the existing GET helper, which cannot send another method, and must print only through the existing redaction helpers, so URLs collapse to hostnames, free text truncates, and webhook headers and token-like keys blank out. Before you run a new mode on real data, run it once and read its output for anything that looks like a secret, a full URL with a query string, or a message body. The harvester needs bash, curl and Python 3.8+ for its inline helpers; the Python tool needs Python 3.8+ and no packages.

@@ -35,18 +35,19 @@ Everything else in this file you may do without asking, as long as it is a GET a
 
 | File | What it holds | When to open it |
 |---|---|---|
-| `scripts/ghl_workflow_mapper.py` | The whole tool: harvest, diagram, and every analysis mode. Python 3.8+ and the system `curl` (GHL refuses Python's built-in HTTP client), no packages. | Run it. Read a named function only when you are adding a mode. |
+| `scripts/bash/harvest_workflows.sh` (with `wf_lib.py`) | The harvester: every network step, `probe`, `tree`, `harvest` and `harvest-triggers`. GET only, through `curl`. | Run it for anything that talks to GHL. |
+| `scripts/ghl_workflow_mapper.py` | The offline tool: `diagram` and every analysis mode, reading the snapshot the harvester saved. Python 3.8+, no packages. It has network modes of its own; this skill does not use them. | Run it for everything after the harvest. Read a named function only when you are adding a mode. |
 | `reference/protocol.md` | The three endpoint hops, exact headers, paging, the trigger endpoint, failure codes, the step-type vocabulary, and how to resolve field and stage ids to names. | A call fails, the JSON shape looks new, or you are extending the script. |
 | `reference/pitfalls.md` | The failure patterns to check workflows against during an audit, and how to diff a clone against its template. | Audit mode, before answering "what could be wrong here". |
 
-Run the script; do not paste its source into the conversation. Its output is the thing you reason over. Treat the script's own usage text (`python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py` with no arguments) as the authority on modes and flags; if a flag here and a flag there disagree, follow the usage text and say so.
+Run the scripts; do not paste their source into the conversation. Their output is the thing you reason over. Each script's own usage text (run it with no arguments) is the authority on its modes and flags; if a flag here and a flag there disagree, follow the usage text and say so.
 
 ## Guardrails
 
 1. **Send GET and nothing else.** Every network call in the script is an HTTP GET. Route any call you add through the script's existing GET helper, which cannot send another method. A write mutates a live automation in a client's account, and the workflow builder has no undo.
 2. **Get the go-ahead before the first call.** Give the owner a short, plain-words overview of what you need permission to do, then wait for a yes before any network call. Cover four things: you will read the workflow definitions in the sub-account they name, using the same requests the GHL web app sends when a person opens the workflow builder; every request is a GET, sent one per second, so nothing in GHL changes; you need them to copy a session token from the browser and store it in the OS secret store, never in the chat; and the definitions are saved to a local folder kept out of version control. Add, as information, that these requests are not part of GHL's public API and GHL can change them without notice, in which case the tool stops rather than retrying. This is a permission request, not an agreement: do not ask the owner to accept terms, and do not record who said yes.
 3. **Stop when the endpoint changes.** A 404 on a single workflow id means that workflow was deleted after you listed it: record it as a gap, do not retry it, and carry on. A 404 on the list or detail endpoint for a location that worked minutes ago, or a response missing a field `reference/protocol.md` says you need, means GHL moved the endpoint: report the request path and what came back, and stop the run. Do not retry in a loop; a retry loop against these endpoints is what gets an agency blocked.
-4. **Treat the session token as a live credential.** Store it in the operating system secret store and let the script read it from there. The token is agency level: one copy reads every sub-account the login can see, and a shell command carrying it is recorded in shell history and in this transcript. The script also accepts a `GHL_TOKEN_ID` environment variable for runners that inject secrets themselves; in an interactive session prefer the secret store, and if you do use the variable, set it inline for the single command (`GHL_TOKEN_ID="$(secret lookup command)" python3 ...`) and never `export` it. Print only the token length, never its value.
+4. **Treat the session token as a live credential.** Store it in the operating system secret store and let the script read it from there. The token is agency level: one copy reads every sub-account the login can see, and a shell command carrying it is recorded in shell history and in this transcript. Both scripts also accept a `GHL_TOKEN_ID` environment variable for runners that inject secrets themselves; in an interactive session prefer the secret store, and if you do use the variable, set it inline for the single command (`GHL_TOKEN_ID="$(secret lookup command)" bash ...`) and never `export` it. Print only the token length, never its value.
 5. **Snapshots are client data and may contain secrets.** Workflow graphs carry webhook URLs with API keys in their headers, Facebook Conversion API tokens, internal phone numbers and email templates. Keep the snapshot folder out of version control: add its name to `.gitignore` in the working directory before the first harvest, and confirm that you did. Every print path must redact URLs to hostnames, truncate free text, and blank webhook headers and token-like keys, as the shipped modes already do.
 6. **The same redaction binds what you write.** Quote webhook URLs by hostname only, quote sends by subject line only, and never copy a raw graph excerpt into chat or into a deliverable. When you need one step's detail, use `inspect-raw`, which redacts on the way out. When you need a view the modes do not give you, add a mode (GET only, printing only through the existing redaction helpers) rather than dumping graph JSON into the conversation.
 7. **Map only the locations the owner named in this request.** If the work suggests reading another location, stop, say which and why, and get a yes first. The token is agency level and will read accounts nobody asked you to touch, so location scope is yours to enforce.
@@ -88,7 +89,7 @@ print("allowed the ghl-workflow-mapper scripts in", p)
 PY
 ```
 
-The rules cover only these two scripts in this folder; to remove them later, the owner deletes the two lines containing `ghl-workflow-mapper` from `.claude/settings.local.json`. From here on, always run the script exactly as `python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py <mode> ...` from the working folder, never by absolute path, so it matches the rule. If a call is still blocked, do not work around it: do not send the same requests another way, and do not edit settings files yourself. Stop and tell the owner.
+The rules cover only these two scripts in this folder; to remove them later, the owner deletes the two lines containing `ghl-workflow-mapper` from `.claude/settings.local.json`. From here on, run every network step (`probe`, `tree`, `harvest`, `harvest-triggers`) as `bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh <mode> ...` and every offline step as `python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py <mode> ...`, from the working folder and never by absolute path, so they match the rules. If a call is still blocked, do not work around it: do not send the same requests another way, and do not edit settings files yourself. Stop and tell the owner.
 
 ### Step 2: Pick the account and get credentials
 
@@ -111,27 +112,27 @@ secret-tool store --label="GHL token-id" service GHL_TOKEN_ID account "$USER"
 # Set-StoredCredential -Target GHL_TOKEN_ID -UserName $env:USERNAME -Password (Get-Clipboard)
 ```
 
-The script reads `GHL_TOKEN_ID` from the environment first (guardrail 4 governs that path), then the macOS keychain item of that name, then libsecret.
+Both scripts read `GHL_TOKEN_ID` from the environment first (guardrail 4 governs that path), then the macOS keychain item of that name, then libsecret.
 
-**Set up the snapshot folder.** Run the script from the working directory of the job, not from inside the skill directory: snapshots land in `GHL_SNAPSHOT_DIR`, defaulting to `.ghl-workflow-snapshots/<locationId>/` relative to the current directory. Add that folder name to `.gitignore` there before the first harvest (guardrail 5).
+**Set up the snapshot folder.** Run the scripts from the working directory of the job, not from inside the skill directory: snapshots land in `GHL_SNAPSHOT_DIR`, defaulting to `.ghl-workflow-snapshots/<locationId>/` relative to the current directory. Add that folder name to `.gitignore` there before the first harvest (guardrail 5).
 
 ### Step 3: Prove access
 
 ```bash
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py probe <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh probe <locationId>
 ```
 
-Four hops: list, detail, step graph, then that one workflow's triggers. The script sends every request through the system `curl` by design; there is nothing to ask the owner about it, and the bash harvester in `scripts/bash/` sends the same requests, so it is not a fallback for a failed probe. It ends with `GRAPH REACHED` or a clear reason. Do not continue past a failure; `reference/protocol.md` maps each status code to its meaning.
+The harvester lists the workflows, opens one, reads its step graph and its triggers, and prints `GRAPH REACHED` or a clear reason. Use the harvester for every network step, always, without asking: the Python tool's own network modes are not part of this skill. Do not continue past a failure; `reference/protocol.md` maps each status code to its meaning.
 
 ### Step 4: Harvest
 
 ```bash
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py tree <locationId>
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py harvest <locationId>
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py harvest-triggers <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh tree <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh harvest <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh harvest-triggers <locationId>
 ```
 
-`tree` lists every workflow id and name with folders recursed. `harvest` saves `<wfId>.detail.json` and `<wfId>.graph.json`. `harvest-triggers` saves each workflow's trigger list from the endpoint the builder itself reads, and reports counts of saved, children and failed. An empty list is expected, not broken: that workflow has no trigger of its own and only runs when another workflow adds the contact, so count it as a child. The script retries a 503 once by itself; record anything still failed as a gap and do not retry again.
+`tree` lists every workflow id and name with folders recursed. `harvest` saves `<wfId>.detail.json` and `<wfId>.graph.json`. `harvest-triggers` saves each workflow's trigger list from the endpoint the builder itself reads, and reports counts of saved, children and failed. An empty list is expected, not broken: that workflow has no trigger of its own and only runs when another workflow adds the contact, so count it as a child. The harvester retries a 503 once by itself; record anything still failed as a gap and do not retry again.
 
 A sub-account of about a hundred workflows is roughly three GETs per workflow at one second apiece, so budget a few minutes. Run the harvest in the background, then **wait for it to exit and check its counts before any offline mode**; the offline modes cannot tell a partial snapshot from a complete one.
 
@@ -144,7 +145,7 @@ python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py diagra
 python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py diagram <locationId> --out workflow-map.md
 ```
 
-`diagram` is offline: it reads the snapshot and writes a Mermaid flowchart. Nodes are workflows (dashed border = draft; the second line shows the trigger type, or "child: no trigger of its own"). Edges are the four relationships that make workflows depend on each other: **adds** the contact to another workflow (solid), **removes** it (dashed), **fires on change** (thick, from a rounded field node that also shows which workflows write that field), and **tests membership** (red dashed, a branch asking whether the contact is currently inside another workflow). Workflows with none of these edges are not drawn; the tool lists them on stderr so you can report the count.
+`diagram` is offline: it reads the snapshot the harvester saved and writes a Mermaid flowchart. Nodes are workflows (dashed border = draft; the second line shows the trigger type, or "child: no trigger of its own"). Edges are the four relationships that make workflows depend on each other: **adds** the contact to another workflow (solid), **removes** it (dashed), **fires on change** (thick, from a rounded field node that also shows which workflows write that field), and **tests membership** (red dashed, a branch asking whether the contact is currently inside another workflow). Workflows with none of these edges are not drawn; the tool lists them on stderr so you can report the count.
 
 Show the result in the session (checkpoint 6):
 
@@ -188,7 +189,7 @@ The document: purpose and scope; how it was produced (commands and snapshot date
 
 ## Refreshing a snapshot
 
-Snapshots go stale the moment someone edits a workflow. To refresh: fresh token, then `harvest`, `harvest-triggers`, `diagram`; diff the new snapshot folder against the old one to see what changed.
+Snapshots go stale the moment someone edits a workflow. To refresh: fresh token, then the harvester's `harvest` and `harvest-triggers`, then `diagram`; diff the new snapshot folder against the old one to see what changed.
 
 ## Starter prompt
 
@@ -197,7 +198,7 @@ GHL_MAPPER_EOF
 cat > "$ROOT/reference/protocol.md" <<'GHL_MAPPER_EOF'
 # GHL internal workflow API: protocol reference
 
-Read this when a call fails, when the JSON shape looks new, or when you are adding a mode to `scripts/ghl_workflow_mapper.py`. Every request described here is a GET. The script implements all of it; this file exists so you can debug and extend it without reading 745 lines of Python.
+Read this when a call fails, when the JSON shape looks new, or when you are adding a mode. Every request described here is a GET, and the skill sends all of them through `scripts/bash/harvest_workflows.sh`; this file exists so you can debug and extend it without reading the script.
 
 ## Contents
 
@@ -233,7 +234,7 @@ GET https://backend.leadconnectorhq.com/workflow/{locationId}/{workflowId}?inclu
 
 Headers: `authorization: Bearer <same token>`, `channel: APP`, `source: WEB_USER`, `origin: https://client-app-automation-workflows.leadconnectorhq.com`, `referer: https://client-app-automation-workflows.leadconnectorhq.com/`. The `origin` and `referer` are the GHL automation builder app host, and the script also sends the API `version` header it was written against. If the detail endpoint starts rejecting these, do not guess new header values: open DevTools on a working builder page, read the request headers GHL itself sends now, and report the difference before changing anything.
 
-The list endpoint wants the token in `token-id`; the detail endpoint wants it as `Bearer`. Same value, different header. This is the single most common cause of a 401 on a token that is actually fine.
+The list endpoint wants the token in `token-id`; the detail and trigger endpoints want it as `Bearer` as well. Same value, different header. The harvester sends `token-id` on every request and adds `Bearer` on the detail and trigger hops; a detail request carrying `Bearer` alone was refused with 401 in September 2026. A missing header is the single most common cause of a 401 on a token that is actually fine.
 
 Response fields you need: `name`, `status` (published or draft), `dataVersion`, `fileUrl` (a signed Firebase Storage URL holding the step graph). `triggersFilePath` and `isTriggerBucketMigrated` may also appear; ignore them and read triggers from their own endpoint (next section).
 
@@ -318,9 +319,9 @@ Contact custom-field **values**, meaning what a human actually typed into a cont
 
 ## Extending the script
 
-Run `python3 scripts/ghl_workflow_mapper.py` with no arguments to print the full mode list and flags. That usage text is the authority on modes and flags; where it and a document disagree, follow it and say so in your report.
+Run either script with no arguments (`bash scripts/bash/harvest_workflows.sh` for the network modes, `python3 scripts/ghl_workflow_mapper.py` for the offline ones) to print its modes and flags. That usage text is the authority on modes and flags; where it and a document disagree, follow it and say so in your report.
 
-Extend it by adding a mode, never by adding a write. A new mode must reach the network only through the existing GET helper, which cannot send another method, and must print only through the existing redaction helpers, so URLs collapse to hostnames, free text truncates, and webhook headers and token-like keys blank out. Before you run a new mode on real data, run it once and read its output for anything that looks like a secret, a full URL with a query string, or a message body. The script needs Python 3.8+ and the standard library only: no curl, no packages.
+Extend it by adding a mode, never by adding a write. A new mode must reach the network only through the existing GET helper, which cannot send another method, and must print only through the existing redaction helpers, so URLs collapse to hostnames, free text truncates, and webhook headers and token-like keys blank out. Before you run a new mode on real data, run it once and read its output for anything that looks like a secret, a full URL with a query string, or a message body. The harvester needs bash, curl and Python 3.8+ for its inline helpers; the Python tool needs Python 3.8+ and no packages.
 GHL_MAPPER_EOF
 cat > "$ROOT/reference/pitfalls.md" <<'GHL_MAPPER_EOF'
 # Pitfalls, and diffing a clone against its template
@@ -368,6 +369,9 @@ GHL_MAPPER_EOF
 cat > "$ROOT/scripts/ghl_workflow_mapper.py" <<'GHL_MAPPER_EOF'
 #!/usr/bin/env python3
 """ghl_workflow_mapper.py - read-only mapper for GoHighLevel workflow internals.
+
+The skill runs every network step through scripts/bash/harvest_workflows.sh and
+uses this tool for the diagram and the offline analysis of the saved snapshots.
 
 READ-ONLY BY CONSTRUCTION: every network call is an HTTP GET, sent through the
 system curl (GHL's edge refuses Python's built-in HTTP client). Do not add a write.
@@ -496,7 +500,7 @@ def list_headers(tok):
     return {"token-id": tok, "channel": "APP", "source": "WEB_USER", "version": "2021-04-15"}
 
 def detail_headers(tok):
-    return {"authorization": f"Bearer {tok}", "channel": "APP", "source": "WEB_USER",
+    return {"token-id": tok, "authorization": f"Bearer {tok}", "channel": "APP", "source": "WEB_USER",
             "origin": "https://client-app-automation-workflows.leadconnectorhq.com",
             "referer": "https://client-app-automation-workflows.leadconnectorhq.com/"}
 
@@ -1336,10 +1340,10 @@ cat > "$ROOT/scripts/bash/harvest_workflows.sh" <<'GHL_MAPPER_EOF'
 # sub-account, using the same read-only requests the workflow builder makes.
 #
 # NOTE
-#   Original bash implementation. The single-file Python tool
-#   `ghl_workflow_mapper.py` in this repo supersedes it and adds the `diagram`
-#   mode; this version is kept for people who prefer bash + jq-free python
-#   heredocs.
+#   The skill runs every network step (probe, tree, harvest, harvest-triggers)
+#   through this script. The Python tool `ghl_workflow_mapper.py` in this repo
+#   draws the `diagram` and runs the offline analysis from the snapshots saved
+#   here.
 #
 # WHY THIS EXISTS
 #   GHL's public API v2 exposes workflow metadata only (id/name/status/version):
@@ -1365,13 +1369,16 @@ cat > "$ROOT/scripts/bash/harvest_workflows.sh" <<'GHL_MAPPER_EOF'
 #
 #     security add-generic-password -U -a "$USER" -s GHL_TOKEN_ID -w "$(pbpaste)"
 #
+#   On Linux the token is read from libsecret (secret-tool, service GHL_TOKEN_ID);
+#   a GHL_TOKEN_ID environment variable, if set, is read first.
+#
 #   Tokens last ~1 hour. Re-copy from DevTools (Network tab, any
 #   backend.leadconnectorhq.com request, Request Headers -> token-id) and re-run
 #   that command when calls start returning 401.
 #
 # USAGE
 #   NETWORK MODES (GET only)
-#     probe            <locationId>                  # 3 calls, verifies access
+#     probe            <locationId>                  # list, detail, graph, triggers
 #     tree             <locationId>                  # enumerate workflows only
 #     harvest          <locationId> [<workflowId> ...]  # detail + graph -> OUT_DIR
 #     harvest-triggers <locationId> [<workflowId> ...]  # builder's trigger list -> <workflowId>.triggers.json
@@ -1390,7 +1397,7 @@ cat > "$ROOT/scripts/bash/harvest_workflows.sh" <<'GHL_MAPPER_EOF'
 #     triggers    <locationId> [<workflowId>]       # harvested trigger definitions
 #     summary     <locationId>                      # which workflows move stages
 #
-#   OUT_DIR defaults to .ghl-workflow-snapshots/<locationId>/ (gitignore it).
+#   OUT_DIR (or GHL_SNAPSHOT_DIR) defaults to .ghl-workflow-snapshots/<locationId>/.
 #   Snapshots are plain JSON so successive runs can be diffed for workflow
 #   drift across the fleet.
 #
@@ -1401,7 +1408,7 @@ set -euo pipefail
 
 BASE="https://backend.leadconnectorhq.com/workflow"
 SLEEP_BETWEEN=1          # seconds; be a polite client, no documented rate limit
-OUT_DIR="${OUT_DIR:-.ghl-workflow-snapshots}"
+OUT_DIR="${OUT_DIR:-${GHL_SNAPSHOT_DIR:-.ghl-workflow-snapshots}}"
 # Shared python helpers (wf_lib.py) live next to this script; the analysis modes
 # pass this path as argv[1] to their heredocs and import from it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1411,13 +1418,20 @@ LOC="${2:-}"
 WF_OVERRIDE="${3:-}"   # workflow id (inspect*/flow/triggers) or first flag/type arg
 
 if [[ -z "$MODE" || -z "$LOC" ]]; then
-  sed -n '2,66p' "$0"
+  sed -n '2,69p' "$0"
   exit 64
 fi
 
-TOKEN="$(security find-generic-password -a "$USER" -s GHL_TOKEN_ID -w 2>/dev/null || true)"
+# Token: GHL_TOKEN_ID from the environment, else the macOS keychain, else libsecret.
+TOKEN="${GHL_TOKEN_ID:-}"
 if [[ -z "$TOKEN" ]]; then
-  echo "ERROR: keychain item GHL_TOKEN_ID not found. See the AUTH section in this script." >&2
+  TOKEN="$(security find-generic-password -a "$USER" -s GHL_TOKEN_ID -w 2>/dev/null || true)"
+fi
+if [[ -z "$TOKEN" ]]; then
+  TOKEN="$(secret-tool lookup service GHL_TOKEN_ID 2>/dev/null || true)"
+fi
+if [[ -z "$TOKEN" ]]; then
+  echo "ERROR: no token. Store it as GHL_TOKEN_ID in the OS secret store (see the AUTH section in this script)." >&2
   exit 3
 fi
 # Minutes until the token's exp claim, read locally from the JWT (no network call).
@@ -1451,7 +1465,7 @@ FULL_HEADERS=(-H "channel: APP" -H "source: WEB_USER" -H "version: 2021-04-15" -
 # token-id) and is called from the automation-builder origin. GHL_BEARER, if
 # present in the keychain, is used here; otherwise the token-id value is tried
 # as a Bearer (works only if GHL issues one JWT for both).
-BEARER="$(security find-generic-password -a "$USER" -s GHL_BEARER -w 2>/dev/null || printf '%s' "$TOKEN")"
+BEARER="${GHL_BEARER:-$(security find-generic-password -a "$USER" -s GHL_BEARER -w 2>/dev/null || printf '%s' "$TOKEN")}"
 DETAIL_HEADERS=(
   -H "authorization: Bearer ${BEARER}"
   -H "channel: APP"
@@ -1586,6 +1600,12 @@ kinds = Counter((s.get("type") or s.get("actionType") or "?") for s in steps if 
 for k, n in kinds.most_common():
     print(f"    {k}: {n}")
 PY
+        echo
+        echo "  --- hop 3: this workflow's triggers (the builder's trigger endpoint) ---"
+        sleep "$SLEEP_BETWEEN"
+        tmp_trig="$(mktemp)"
+        tcode="$(ghl_get "${BASE}/${LOC}/trigger?workflowId=${wf_id}" "$tmp_trig" "${DETAIL_HEADERS[@]}")"
+        echo "  [$tcode] triggers: $(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from wf_lib import load_json, trigger_list; d = load_json(sys.argv[2]); print("not JSON" if d is None else str(len(trigger_list(d))) + " trigger(s)")' "$SCRIPT_DIR" "$tmp_trig")"
         echo
         echo "  GRAPH REACHED: full workflow internals are available."
         echo "  detail: $tmp_wf   graph: $tmp_graph"

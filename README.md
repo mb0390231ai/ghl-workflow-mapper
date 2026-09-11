@@ -27,7 +27,7 @@ From the root of the folder you want to work in (a scratch repo is fine):
 curl -fsSL https://raw.githubusercontent.com/mb0390231ai/ghl-workflow-mapper/main/install.sh | bash
 ```
 
-or copy the files by hand into `.claude/skills/ghl-workflow-mapper/`. The skill needs the first four; `scripts/bash/` is the optional bash harvester (see "What is in the tool" below).
+or copy all six files by hand into `.claude/skills/ghl-workflow-mapper/`. The skill uses both scripts: the bash harvester downloads, and the Python tool draws and analyses (see "What is in the tool" below).
 
 ```
 .claude/skills/ghl-workflow-mapper/
@@ -37,7 +37,7 @@ or copy the files by hand into `.claude/skills/ghl-workflow-mapper/`. The skill 
 │   └── pitfalls.md
 └── scripts/
     ├── ghl_workflow_mapper.py
-    └── bash/                      (optional)
+    └── bash/
         ├── harvest_workflows.sh
         └── wf_lib.py
 ```
@@ -83,9 +83,11 @@ The agent will explain what it is about to do and what it needs from you (the su
 
 ## What is in the tool
 
-`scripts/ghl_workflow_mapper.py`, Python 3.8+ with the system `curl` (preinstalled on macOS, Windows 10+ and most Linux), no packages. Modes: `probe`, `tree`, `harvest`, `harvest-triggers` (network, GET only) and `diagram`, `schema`, `flow`, `triggers`, `inspect-raw`, `inventory`, `fields`, `summary` (offline, against the saved snapshot). Run it with no arguments for usage.
+`scripts/bash/harvest_workflows.sh` with `scripts/bash/wf_lib.py` is the harvester: every network step the skill runs goes through it (`probe`, `tree`, `harvest`, `harvest-triggers`; GET only, through curl; bash 3.2 compatible, with inline Python helpers). It also has offline modes, including `inspect` and `inspect-full` for diffing one location's copy of a workflow against the template it was cloned from.
 
-`scripts/bash/harvest_workflows.sh` with `scripts/bash/wf_lib.py` is the original bash implementation (bash 3.2 compatible, curl plus inline Python heredocs). Same read-only protocol, same snapshot layout, same offline modes minus `diagram`, plus `inspect` and `inspect-full` for diffing one location's copy of a workflow against the template it was cloned from. The Python tool supersedes it; it is kept for people who prefer bash. Run it with no arguments for usage.
+`scripts/ghl_workflow_mapper.py` (Python 3.8+, no packages) reads the snapshot the harvester saves and draws the `diagram`, plus `schema`, `flow`, `triggers`, `inspect-raw`, `inventory`, `fields` and `summary`. It has network modes of its own, but the skill does not use them.
+
+Run either script with no arguments for usage.
 
 ## Example
 

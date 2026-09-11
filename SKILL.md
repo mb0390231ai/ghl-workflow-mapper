@@ -29,18 +29,19 @@ Everything else in this file you may do without asking, as long as it is a GET a
 
 | File | What it holds | When to open it |
 |---|---|---|
-| `scripts/ghl_workflow_mapper.py` | The whole tool: harvest, diagram, and every analysis mode. Python 3.8+ and the system `curl` (GHL refuses Python's built-in HTTP client), no packages. | Run it. Read a named function only when you are adding a mode. |
+| `scripts/bash/harvest_workflows.sh` (with `wf_lib.py`) | The harvester: every network step, `probe`, `tree`, `harvest` and `harvest-triggers`. GET only, through `curl`. | Run it for anything that talks to GHL. |
+| `scripts/ghl_workflow_mapper.py` | The offline tool: `diagram` and every analysis mode, reading the snapshot the harvester saved. Python 3.8+, no packages. It has network modes of its own; this skill does not use them. | Run it for everything after the harvest. Read a named function only when you are adding a mode. |
 | `reference/protocol.md` | The three endpoint hops, exact headers, paging, the trigger endpoint, failure codes, the step-type vocabulary, and how to resolve field and stage ids to names. | A call fails, the JSON shape looks new, or you are extending the script. |
 | `reference/pitfalls.md` | The failure patterns to check workflows against during an audit, and how to diff a clone against its template. | Audit mode, before answering "what could be wrong here". |
 
-Run the script; do not paste its source into the conversation. Its output is the thing you reason over. Treat the script's own usage text (`python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py` with no arguments) as the authority on modes and flags; if a flag here and a flag there disagree, follow the usage text and say so.
+Run the scripts; do not paste their source into the conversation. Their output is the thing you reason over. Each script's own usage text (run it with no arguments) is the authority on its modes and flags; if a flag here and a flag there disagree, follow the usage text and say so.
 
 ## Guardrails
 
 1. **Send GET and nothing else.** Every network call in the script is an HTTP GET. Route any call you add through the script's existing GET helper, which cannot send another method. A write mutates a live automation in a client's account, and the workflow builder has no undo.
 2. **Get the go-ahead before the first call.** Give the owner a short, plain-words overview of what you need permission to do, then wait for a yes before any network call. Cover four things: you will read the workflow definitions in the sub-account they name, using the same requests the GHL web app sends when a person opens the workflow builder; every request is a GET, sent one per second, so nothing in GHL changes; you need them to copy a session token from the browser and store it in the OS secret store, never in the chat; and the definitions are saved to a local folder kept out of version control. Add, as information, that these requests are not part of GHL's public API and GHL can change them without notice, in which case the tool stops rather than retrying. This is a permission request, not an agreement: do not ask the owner to accept terms, and do not record who said yes.
 3. **Stop when the endpoint changes.** A 404 on a single workflow id means that workflow was deleted after you listed it: record it as a gap, do not retry it, and carry on. A 404 on the list or detail endpoint for a location that worked minutes ago, or a response missing a field `reference/protocol.md` says you need, means GHL moved the endpoint: report the request path and what came back, and stop the run. Do not retry in a loop; a retry loop against these endpoints is what gets an agency blocked.
-4. **Treat the session token as a live credential.** Store it in the operating system secret store and let the script read it from there. The token is agency level: one copy reads every sub-account the login can see, and a shell command carrying it is recorded in shell history and in this transcript. The script also accepts a `GHL_TOKEN_ID` environment variable for runners that inject secrets themselves; in an interactive session prefer the secret store, and if you do use the variable, set it inline for the single command (`GHL_TOKEN_ID="$(secret lookup command)" python3 ...`) and never `export` it. Print only the token length, never its value.
+4. **Treat the session token as a live credential.** Store it in the operating system secret store and let the script read it from there. The token is agency level: one copy reads every sub-account the login can see, and a shell command carrying it is recorded in shell history and in this transcript. Both scripts also accept a `GHL_TOKEN_ID` environment variable for runners that inject secrets themselves; in an interactive session prefer the secret store, and if you do use the variable, set it inline for the single command (`GHL_TOKEN_ID="$(secret lookup command)" bash ...`) and never `export` it. Print only the token length, never its value.
 5. **Snapshots are client data and may contain secrets.** Workflow graphs carry webhook URLs with API keys in their headers, Facebook Conversion API tokens, internal phone numbers and email templates. Keep the snapshot folder out of version control: add its name to `.gitignore` in the working directory before the first harvest, and confirm that you did. Every print path must redact URLs to hostnames, truncate free text, and blank webhook headers and token-like keys, as the shipped modes already do.
 6. **The same redaction binds what you write.** Quote webhook URLs by hostname only, quote sends by subject line only, and never copy a raw graph excerpt into chat or into a deliverable. When you need one step's detail, use `inspect-raw`, which redacts on the way out. When you need a view the modes do not give you, add a mode (GET only, printing only through the existing redaction helpers) rather than dumping graph JSON into the conversation.
 7. **Map only the locations the owner named in this request.** If the work suggests reading another location, stop, say which and why, and get a yes first. The token is agency level and will read accounts nobody asked you to touch, so location scope is yours to enforce.
@@ -82,7 +83,7 @@ print("allowed the ghl-workflow-mapper scripts in", p)
 PY
 ```
 
-The rules cover only these two scripts in this folder; to remove them later, the owner deletes the two lines containing `ghl-workflow-mapper` from `.claude/settings.local.json`. From here on, always run the script exactly as `python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py <mode> ...` from the working folder, never by absolute path, so it matches the rule. If a call is still blocked, do not work around it: do not send the same requests another way, and do not edit settings files yourself. Stop and tell the owner.
+The rules cover only these two scripts in this folder; to remove them later, the owner deletes the two lines containing `ghl-workflow-mapper` from `.claude/settings.local.json`. From here on, run every network step (`probe`, `tree`, `harvest`, `harvest-triggers`) as `bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh <mode> ...` and every offline step as `python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py <mode> ...`, from the working folder and never by absolute path, so they match the rules. If a call is still blocked, do not work around it: do not send the same requests another way, and do not edit settings files yourself. Stop and tell the owner.
 
 ### Step 2: Pick the account and get credentials
 
@@ -105,27 +106,27 @@ secret-tool store --label="GHL token-id" service GHL_TOKEN_ID account "$USER"
 # Set-StoredCredential -Target GHL_TOKEN_ID -UserName $env:USERNAME -Password (Get-Clipboard)
 ```
 
-The script reads `GHL_TOKEN_ID` from the environment first (guardrail 4 governs that path), then the macOS keychain item of that name, then libsecret.
+Both scripts read `GHL_TOKEN_ID` from the environment first (guardrail 4 governs that path), then the macOS keychain item of that name, then libsecret.
 
-**Set up the snapshot folder.** Run the script from the working directory of the job, not from inside the skill directory: snapshots land in `GHL_SNAPSHOT_DIR`, defaulting to `.ghl-workflow-snapshots/<locationId>/` relative to the current directory. Add that folder name to `.gitignore` there before the first harvest (guardrail 5).
+**Set up the snapshot folder.** Run the scripts from the working directory of the job, not from inside the skill directory: snapshots land in `GHL_SNAPSHOT_DIR`, defaulting to `.ghl-workflow-snapshots/<locationId>/` relative to the current directory. Add that folder name to `.gitignore` there before the first harvest (guardrail 5).
 
 ### Step 3: Prove access
 
 ```bash
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py probe <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh probe <locationId>
 ```
 
-Four hops: list, detail, step graph, then that one workflow's triggers. The script sends every request through the system `curl` by design; there is nothing to ask the owner about it, and the bash harvester in `scripts/bash/` sends the same requests, so it is not a fallback for a failed probe. It ends with `GRAPH REACHED` or a clear reason. Do not continue past a failure; `reference/protocol.md` maps each status code to its meaning.
+The harvester lists the workflows, opens one, reads its step graph and its triggers, and prints `GRAPH REACHED` or a clear reason. Use the harvester for every network step, always, without asking: the Python tool's own network modes are not part of this skill. Do not continue past a failure; `reference/protocol.md` maps each status code to its meaning.
 
 ### Step 4: Harvest
 
 ```bash
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py tree <locationId>
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py harvest <locationId>
-python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py harvest-triggers <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh tree <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh harvest <locationId>
+bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh harvest-triggers <locationId>
 ```
 
-`tree` lists every workflow id and name with folders recursed. `harvest` saves `<wfId>.detail.json` and `<wfId>.graph.json`. `harvest-triggers` saves each workflow's trigger list from the endpoint the builder itself reads, and reports counts of saved, children and failed. An empty list is expected, not broken: that workflow has no trigger of its own and only runs when another workflow adds the contact, so count it as a child. The script retries a 503 once by itself; record anything still failed as a gap and do not retry again.
+`tree` lists every workflow id and name with folders recursed. `harvest` saves `<wfId>.detail.json` and `<wfId>.graph.json`. `harvest-triggers` saves each workflow's trigger list from the endpoint the builder itself reads, and reports counts of saved, children and failed. An empty list is expected, not broken: that workflow has no trigger of its own and only runs when another workflow adds the contact, so count it as a child. The harvester retries a 503 once by itself; record anything still failed as a gap and do not retry again.
 
 A sub-account of about a hundred workflows is roughly three GETs per workflow at one second apiece, so budget a few minutes. Run the harvest in the background, then **wait for it to exit and check its counts before any offline mode**; the offline modes cannot tell a partial snapshot from a complete one.
 
@@ -138,7 +139,7 @@ python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py diagra
 python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py diagram <locationId> --out workflow-map.md
 ```
 
-`diagram` is offline: it reads the snapshot and writes a Mermaid flowchart. Nodes are workflows (dashed border = draft; the second line shows the trigger type, or "child: no trigger of its own"). Edges are the four relationships that make workflows depend on each other: **adds** the contact to another workflow (solid), **removes** it (dashed), **fires on change** (thick, from a rounded field node that also shows which workflows write that field), and **tests membership** (red dashed, a branch asking whether the contact is currently inside another workflow). Workflows with none of these edges are not drawn; the tool lists them on stderr so you can report the count.
+`diagram` is offline: it reads the snapshot the harvester saved and writes a Mermaid flowchart. Nodes are workflows (dashed border = draft; the second line shows the trigger type, or "child: no trigger of its own"). Edges are the four relationships that make workflows depend on each other: **adds** the contact to another workflow (solid), **removes** it (dashed), **fires on change** (thick, from a rounded field node that also shows which workflows write that field), and **tests membership** (red dashed, a branch asking whether the contact is currently inside another workflow). Workflows with none of these edges are not drawn; the tool lists them on stderr so you can report the count.
 
 Show the result in the session (checkpoint 6):
 
@@ -182,7 +183,7 @@ The document: purpose and scope; how it was produced (commands and snapshot date
 
 ## Refreshing a snapshot
 
-Snapshots go stale the moment someone edits a workflow. To refresh: fresh token, then `harvest`, `harvest-triggers`, `diagram`; diff the new snapshot folder against the old one to see what changed.
+Snapshots go stale the moment someone edits a workflow. To refresh: fresh token, then the harvester's `harvest` and `harvest-triggers`, then `diagram`; diff the new snapshot folder against the old one to see what changed.
 
 ## Starter prompt
 
