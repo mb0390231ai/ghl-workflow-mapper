@@ -2,7 +2,7 @@
 # Installs the ghl-workflow-mapper skill into the current directory's .claude/skills/
 set -euo pipefail
 ROOT=".claude/skills/ghl-workflow-mapper"
-mkdir -p "$ROOT/reference" "$ROOT/scripts"
+mkdir -p "$ROOT/reference" "$ROOT/scripts/bash"
 cat > "$ROOT/SKILL.md" <<'GHL_MAPPER_EOF'
 ---
 name: ghl-workflow-mapper
@@ -1275,6 +1275,1677 @@ def main(argv):
 if __name__ == "__main__":
     main(sys.argv)
 GHL_MAPPER_EOF
-chmod +x "$ROOT/scripts/ghl_workflow_mapper.py"
+cat > "$ROOT/scripts/bash/harvest_workflows.sh" <<'GHL_MAPPER_EOF'
+#!/usr/bin/env bash
+# Read GoHighLevel workflow definitions (including action graphs) for one
+# sub-account, using the same read-only requests the workflow builder makes.
+#
+# NOTE
+#   Original bash implementation. The single-file Python tool
+#   `ghl_workflow_mapper.py` in this repo supersedes it and adds the `diagram`
+#   mode; this version is kept for people who prefer bash + jq-free python
+#   heredocs.
+#
+# WHY THIS EXISTS
+#   GHL's public API v2 exposes workflow metadata only (id/name/status/version):
+#   there is no endpoint for a workflow's actions. You need the actions to audit
+#   an automated process across a fleet of sub-accounts, e.g. to find which
+#   locations really move an opportunity stage and which silently skip it.
+#
+#   The endpoints below are the ones GHL's own web app calls. These are the same
+#   read-only requests the browser makes when the workflow builder is open. They
+#   are not part of GHL's public API and can change without notice; the account
+#   owner should confirm this use is acceptable under their own agreement with
+#   GHL before running it. Keep usage read-only, rate-limited, and infrequent.
+#   If a call starts returning 404 or a different JSON shape, assume GHL moved
+#   it, and do not escalate retries.
+#
+# READ-ONLY BY CONSTRUCTION
+#   Only GET is issued. There is no code path here that writes to GHL. Do not
+#   add one: a bad write would mutate a live automation.
+#
+# AUTH
+#   A Firebase session JWT ("token-id" header), stored in the macOS keychain
+#   so it never lands in shell history, a file, or this repo:
+#
+#     security add-generic-password -U -a "$USER" -s GHL_TOKEN_ID -w "$(pbpaste)"
+#
+#   Tokens last ~1 hour. Re-copy from DevTools (Network tab, any
+#   backend.leadconnectorhq.com request, Request Headers -> token-id) and re-run
+#   that command when calls start returning 401.
+#
+# USAGE
+#   NETWORK MODES (GET only)
+#     probe            <locationId>                  # 3 calls, verifies access
+#     tree             <locationId>                  # enumerate workflows only
+#     harvest          <locationId> [<workflowId> ...]  # detail + graph -> OUT_DIR
+#     harvest-triggers <locationId> [<workflowId> ...]  # -> <workflowId>.triggers.json
+#
+#   OFFLINE MODES (read the snapshots already in OUT_DIR)
+#     schema      <locationId> [stepType]           # step-type vocabulary + attr paths
+#     inventory   <locationId> --anchor "<name>" [--md] [--core-names "A,B"]
+#                       [--process-regex RE] [--expect-count N]
+#                       [--require-core "A,B,C"] [--only CLASS,..]
+#                       [--grep SUBSTR] [--footer-only]
+#     fields      <locationId> [--md] [--min-wf N] [--section fields|tokens|both]
+#     flow        <locationId> <workflowId>         # linearized narrative
+#     inspect     <locationId> <workflowId>         # step list + stage-move targets
+#     inspect-full <locationId> <workflowId>        # every branch condition, in full
+#     inspect-raw <locationId> <workflowId> <stepIndex|nodeId>  # one step's JSON
+#     triggers    <locationId> [<workflowId>]       # harvested trigger definitions
+#     summary     <locationId>                      # which workflows move stages
+#
+#   OUT_DIR defaults to .ghl-workflow-snapshots/<locationId>/ (gitignore it).
+#   Snapshots are plain JSON so successive runs can be diffed for workflow
+#   drift across the fleet.
+#
+#   The offline modes share python helpers in wf_lib.py, next to this script.
+#   Route analysis THROUGH these modes rather than reading the snapshot files
+#   ad hoc: if you need something new, add a mode.
+set -euo pipefail
+
+BASE="https://backend.leadconnectorhq.com/workflow"
+SLEEP_BETWEEN=1          # seconds; be a polite client, no documented rate limit
+OUT_DIR="${OUT_DIR:-.ghl-workflow-snapshots}"
+# Shared python helpers (wf_lib.py) live next to this script; the analysis modes
+# pass this path as argv[1] to their heredocs and import from it.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+MODE="${1:-}"
+LOC="${2:-}"
+WF_OVERRIDE="${3:-}"   # workflow id (inspect*/flow/triggers) or first flag/type arg
+
+if [[ -z "$MODE" || -z "$LOC" ]]; then
+  sed -n '2,66p' "$0"
+  exit 64
+fi
+
+TOKEN="$(security find-generic-password -a "$USER" -s GHL_TOKEN_ID -w 2>/dev/null || true)"
+if [[ -z "$TOKEN" ]]; then
+  echo "ERROR: keychain item GHL_TOKEN_ID not found. See the AUTH section in this script." >&2
+  exit 3
+fi
+echo "token loaded (${#TOKEN} chars, value not printed)"
+
+# GET $1 into file $2; echoes the HTTP status. Extra args are passed to curl,
+# which is how the probe swaps in a reduced header set.
+ghl_get() {
+  local url="$1" dest="$2"; shift 2
+  curl -sS -o "$dest" -w '%{http_code}' "$url" \
+    -H "token-id: ${TOKEN}" \
+    "$@"
+}
+
+FULL_HEADERS=(-H "channel: APP" -H "source: WEB_USER" -H "version: 2021-04-15" -H "Content-Type: application/json")
+
+# The workflow DETAIL endpoint authenticates with authorization: Bearer (not
+# token-id) and is called from the automation-builder origin. GHL_BEARER, if
+# present in the keychain, is used here; otherwise the token-id value is tried
+# as a Bearer (works only if GHL issues one JWT for both).
+BEARER="$(security find-generic-password -a "$USER" -s GHL_BEARER -w 2>/dev/null || printf '%s' "$TOKEN")"
+DETAIL_HEADERS=(
+  -H "authorization: Bearer ${BEARER}"
+  -H "channel: APP"
+  -H "source: WEB_USER"
+  -H "origin: https://client-app-automation-workflows.leadconnectorhq.com"
+  -H "referer: https://client-app-automation-workflows.leadconnectorhq.com/"
+)
+
+# Summarize a JSON payload without printing it (these responses are large, and
+# they hold account data we do not want spilling into a transcript).
+summarize() {
+  python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as fh:
+        doc = json.load(fh)
+except Exception as exc:
+    print(f"  not JSON ({exc.__class__.__name__}); first bytes: {open(path,'rb').read(120)!r}")
+    raise SystemExit
+def keys(obj):
+    return sorted(obj)[:14] if isinstance(obj, dict) else type(obj).__name__
+print(f"  top-level keys: {keys(doc)}")
+if isinstance(doc, dict):
+    for field in ("workflows", "rows", "templates", "steps", "actions", "triggers"):
+        val = doc.get(field)
+        if isinstance(val, list):
+            print(f"  {field}: {len(val)} item(s)")
+    for field in ("fileUrl", "triggersFilePath"):
+        if doc.get(field):
+            print(f"  {field}: present (second Firebase hop needed)")
+PY
+}
+
+# Recursively walk the folder tree from a parentId, emitting "type<TAB>id<TAB>name"
+# for every node. GHL's list is one level deep per call: directories hold children
+# reached by listing with parentId=<dirId>. Root is listed with parentId=root.
+# Populates the global arrays WF_IDS / WF_NAMES with workflows (type=workflow).
+WF_IDS=(); WF_NAMES=()
+walk_tree() {
+  local parent="$1" depth="${2:-0}"
+  local lf; lf="$(mktemp)"
+  local code
+  code="$(ghl_get "${BASE}/${LOC}/list?parentId=${parent}&limit=500&offset=0" "$lf" "${FULL_HEADERS[@]}")"
+  if [[ "$code" != "200" ]]; then echo "  list(parentId=${parent}) -> HTTP $code" >&2; return; fi
+  while IFS=$'\t' read -r t id name; do
+    [[ -z "$id" ]] && continue
+    if [[ "$t" == "directory" || "$t" == "folder" ]]; then
+      sleep "$SLEEP_BETWEEN"
+      walk_tree "$id" $((depth+1))
+    elif [[ "$t" == "workflow" ]]; then
+      WF_IDS+=("$id"); WF_NAMES+=("$name")
+    fi
+  done < <(python3 -c '
+import json,sys
+doc=json.load(open(sys.argv[1]))
+for r in (doc.get("rows") or []):
+    print("\t".join([str(r.get("type","")), str(r.get("id","")), str(r.get("name","")).replace("\t"," ")]))' "$lf")
+}
+
+case "$MODE" in
+probe)
+  echo
+  echo "=== 1. list, full header set ==="
+  tmp_full="$(mktemp)"
+  code="$(ghl_get "${BASE}/${LOC}/list?limit=25&offset=0" "$tmp_full" "${FULL_HEADERS[@]}")"
+  echo "HTTP $code"
+  [[ "$code" == "200" ]] && summarize "$tmp_full"
+  if [[ "$code" != "200" ]]; then
+    echo "Stopping: cannot list workflows for $LOC (401 = stale token, 403 = token not scoped to this location)." >&2
+    head -c 300 "$tmp_full" >&2; echo >&2
+    exit 4
+  fi
+
+  sleep "$SLEEP_BETWEEN"
+  echo
+  echo "=== 2. list, token-only headers (are the rest actually required?) ==="
+  tmp_min="$(mktemp)"
+  code_min="$(ghl_get "${BASE}/${LOC}/list?limit=5&offset=0" "$tmp_min")"
+  echo "HTTP $code_min $([[ "$code_min" == "200" ]] && echo '(extra headers are optional)' || echo '(extra headers are required)')"
+
+  echo
+  echo "=== 3. list row shape (field names only, no values) ==="
+  wf_id="$(python3 -c '
+import json,sys
+from collections import Counter
+doc=json.load(open(sys.argv[1]))
+rows=doc.get("rows") or doc.get("workflows") or doc.get("data") or []
+if rows:
+    print("  row fields: " + ", ".join(sorted(rows[0])), file=sys.stderr)
+    types=Counter(r.get("type","?") for r in rows)
+    print("  type distribution: " + ", ".join(f"{t}={n}" for t,n in types.items()), file=sys.stderr)
+# prefer a non-folder row so the detail call resolves
+def is_wf(r): return str(r.get("type","")).lower() not in ("folder","")
+first_wf=next((r for r in rows if is_wf(r)), None)
+print(first_wf.get("id","") if first_wf else (rows[0].get("id","") if rows else ""))' "$tmp_full")"
+  [[ -n "$WF_OVERRIDE" ]] && wf_id="$WF_OVERRIDE" && echo "  (using workflow-id override: $wf_id)"
+  if [[ -z "$wf_id" ]]; then
+    echo "No workflow id found in the list response; inspect $tmp_full by hand."
+    exit 5
+  fi
+
+  echo
+  echo "=== 4. workflow detail (real endpoint: Bearer auth, ?includeScheduledPauseInfo=true) ==="
+  # The list endpoint authenticates with the token-id header; the DETAIL endpoint
+  # authenticates with authorization: Bearer. We try the same keychain token as a
+  # Bearer first: if it 401s, a separate Bearer token is needed (see AUTH notes).
+  tmp_wf="$(mktemp)"
+  detail_url="${BASE}/${LOC}/${wf_id}?includeScheduledPauseInfo=true"
+  code_wf="$(ghl_get "$detail_url" "$tmp_wf" "${DETAIL_HEADERS[@]}")"
+  bytes="$(wc -c <"$tmp_wf" | tr -d ' ')"
+  echo "  [$code_wf] ${bytes}b  ${detail_url#https://backend.leadconnectorhq.com/workflow/}"
+  if [[ "$code_wf" == "200" && "$bytes" -gt 50 ]]; then
+    echo "  detail endpoint OK"
+    summarize "$tmp_wf"
+    echo
+    echo "  --- hop 2: fetching the step graph from fileUrl (signed, no auth) ---"
+    file_url="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fileUrl",""))' "$tmp_wf")"
+    if [[ -n "$file_url" ]]; then
+      sleep "$SLEEP_BETWEEN"
+      tmp_graph="$(mktemp)"
+      gcode="$(curl -sS -o "$tmp_graph" -w '%{http_code}' "$file_url")"
+      gbytes="$(wc -c <"$tmp_graph" | tr -d ' ')"
+      echo "  [$gcode] ${gbytes}b  step graph"
+      if [[ "$gcode" == "200" ]]; then
+        python3 - "$tmp_graph" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+steps = doc.get("steps") or doc.get("templates") or (doc if isinstance(doc, list) else [])
+print(f"  step graph: {len(steps)} step(s)")
+from collections import Counter
+kinds = Counter((s.get("type") or s.get("actionType") or "?") for s in steps if isinstance(s, dict))
+for k, n in kinds.most_common():
+    print(f"    {k}: {n}")
+PY
+        echo
+        echo "  GRAPH REACHED: full workflow internals are available."
+        echo "  detail: $tmp_wf   graph: $tmp_graph"
+      else
+        echo "  fileUrl fetch failed ($gcode); body: $(head -c 160 "$tmp_graph")" >&2
+      fi
+    else
+      echo "  no fileUrl in detail response; graph may be inline, inspect $tmp_wf" >&2
+    fi
+  elif [[ "$code_wf" == "401" ]]; then
+    echo "  401: the token-id value does not work as a Bearer here." >&2
+    echo "  The detail endpoint needs the authorization: Bearer token (separate from token-id)." >&2
+    echo "  Store it: security add-generic-password -U -a \"\$USER\" -s GHL_BEARER -w \"\$(pbpaste)\"" >&2
+    exit 6
+  else
+    echo "  unexpected status; body: $(head -c 200 "$tmp_wf")" >&2
+    exit 6
+  fi
+  ;;
+
+tree)
+  echo "walking folder tree for $LOC (enumerate only, no detail fetches)..."
+  walk_tree root 0
+  echo "found ${#WF_IDS[@]} workflow(s) across the folder tree:"
+  for i in "${!WF_IDS[@]}"; do
+    printf '  %s  %s\n' "${WF_IDS[$i]}" "${WF_NAMES[$i]}"
+  done
+  ;;
+
+harvest)
+  dest="${OUT_DIR}/${LOC}"
+  mkdir -p "$dest"
+  echo "harvesting $LOC -> $dest"
+  # Explicit id list via args 3+ fetches exactly those; otherwise walk the whole tree.
+  if [[ -n "${3:-}" ]]; then
+    WF_IDS=("${@:3}")
+    echo "${#WF_IDS[@]} workflow(s) requested by id"
+  else
+    echo "walking folder tree..."
+    walk_tree root 0
+    echo "${#WF_IDS[@]} workflow(s) to fetch"
+  fi
+  ok=0; failed=0
+  for i in "${!WF_IDS[@]}"; do
+    id="${WF_IDS[$i]}"
+    sleep "$SLEEP_BETWEEN"
+    # hop 1: detail (Bearer) -> fileUrl
+    detail="${dest}/${id}.detail.json"
+    c="$(ghl_get "${BASE}/${LOC}/${id}?includeScheduledPauseInfo=true" "$detail" "${DETAIL_HEADERS[@]}")"
+    if [[ "$c" != "200" ]]; then failed=$((failed+1)); echo "  $id detail -> HTTP $c" >&2; continue; fi
+    # hop 2: step graph from signed fileUrl (no auth)
+    furl="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fileUrl",""))' "$detail")"
+    if [[ -n "$furl" ]]; then
+      sleep "$SLEEP_BETWEEN"
+      gc="$(curl -sS -o "${dest}/${id}.graph.json" -w '%{http_code}' "$furl")"
+      [[ "$gc" != "200" ]] && echo "  $id graph -> HTTP $gc" >&2
+    fi
+    ok=$((ok+1))
+  done
+  echo "done: $ok workflow(s) saved to $dest, $failed failed"
+  ;;
+
+inspect)
+  # Read back a saved workflow graph and print its action structure.
+  # Workflow automations are logic, not contact PII, so it is safe to display.
+  wf="${WF_OVERRIDE:?usage: inspect <locationId> <workflowId>}"
+  gfile="${OUT_DIR}/${LOC}/${wf}.graph.json"
+  dfile="${OUT_DIR}/${LOC}/${wf}.detail.json"
+  [[ -f "$gfile" ]] || { echo "no saved graph at $gfile (harvest it first)" >&2; exit 2; }
+  python3 - "$gfile" "$dfile" <<'PY'
+import json, sys
+graph = json.load(open(sys.argv[1]))
+try:
+    detail = json.load(open(sys.argv[2]))
+    print(f"workflow: {detail.get('name','?')}  (status={detail.get('status','?')}, dataVersion={detail.get('dataVersion','?')})")
+except Exception:
+    pass
+steps = graph.get("steps") or graph.get("templates") or (graph if isinstance(graph, list) else [])
+print(f"{len(steps)} step(s):\n")
+STAGE_HINT = ("stage", "pipeline", "opportunity", "status")
+for i, s in enumerate(steps):
+    if not isinstance(s, dict):
+        continue
+    typ = s.get("type") or s.get("actionType") or "?"
+    name = s.get("name") or ""
+    print(f"[{i}] {typ}  {name}")
+    attrs = s.get("attributes") or s.get("config") or {}
+    # branch conditions (if_else etc.)
+    conds = attrs.get("conditions") or s.get("conditions")
+    if conds:
+        blob = json.dumps(conds)
+        print(f"      conditions: {blob[:300]}")
+    # anything that looks like it sets a pipeline stage
+    for k, v in attrs.items():
+        if any(h in k.lower() for h in STAGE_HINT):
+            print(f"      {k}: {json.dumps(v)[:200]}")
+PY
+  ;;
+
+inspect-full)
+  # Like inspect, but prints COMPLETE if_else conditions and the full attributes of
+  # every opportunity-writing step, for diffing one location's copy against the
+  # template it was cloned from.
+  wf="${WF_OVERRIDE:?usage: inspect-full <locationId> <workflowId>}"
+  gfile="${OUT_DIR}/${LOC}/${wf}.graph.json"
+  [[ -f "$gfile" ]] || { echo "no saved graph at $gfile (harvest it first)" >&2; exit 2; }
+  python3 - "$gfile" <<'PY'
+import json, sys
+graph = json.load(open(sys.argv[1]))
+steps = graph.get("steps") or graph.get("templates") or (graph if isinstance(graph, list) else [])
+for i, s in enumerate(steps):
+    if not isinstance(s, dict):
+        continue
+    typ = s.get("type") or s.get("actionType") or "?"
+    attrs = s.get("attributes") or s.get("config") or {}
+    if typ == "if_else":
+        branches = attrs.get("branches") or []
+        if not branches:
+            continue  # leaf branch-yes node; conditions live on its parent
+        print(f"[{i}] if_else  {s.get('name','')}  ({len(branches)} branch(es))")
+        for b in branches:
+            tests = []
+            for seg in b.get("segments") or []:
+                for c in seg.get("conditions") or []:
+                    tests.append(f"{c.get('conditionType')}:{c.get('conditionSubType')} {c.get('conditionOperator')} {json.dumps(c.get('conditionValue'))}")
+            print(f"     - {b.get('name','?')!r}: " + (" AND ".join(tests) if tests else "(no conditions)"))
+    elif "opportunity" in typ or typ.startswith("update_"):
+        print(f"[{i}] {typ}  {s.get('name','')}")
+        print("     " + json.dumps(attrs, sort_keys=True))
+PY
+  ;;
+
+inspect-raw)
+  # Dump the complete JSON of ONE step (by index or node id) so we can see where a
+  # step type keeps its config, e.g. where if_else stores its branch conditions.
+  # Secret-bearing keys (webhook headers, tokens) are blanked before printing.
+  #   inspect-raw <locationId> <workflowId> <stepIndex|nodeId>
+  wf="${WF_OVERRIDE:?usage: inspect-raw <locationId> <workflowId> <stepIndex|nodeId>}"
+  idx="${4:?stepIndex or nodeId required}"
+  gfile="${OUT_DIR}/${LOC}/${wf}.graph.json"
+  [[ -f "$gfile" ]] || { echo "no saved graph at $gfile (harvest it first)" >&2; exit 2; }
+  python3 - "$SCRIPT_DIR" "$gfile" "$idx" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+graph = json.load(open(sys.argv[2])); key = sys.argv[3]
+steps = steps_of(graph)
+# numeric -> index; otherwise treat as a step id (GHL node ids survive cloning, so
+# the same id can be dumped across locations for a like-for-like diff)
+if key.isdigit():
+    node = steps[int(key)]
+else:
+    node = next((s for s in steps if s.get("id") == key), None)
+    if node is None:
+        print(f"no step with id {key}"); raise SystemExit(1)
+    print(f"(step index {steps.index(node)})")
+print(json.dumps(redact_deep(node), indent=1, sort_keys=True, ensure_ascii=False)[:6000])
+PY
+  ;;
+
+summary)
+  # Scan every harvested graph and report which workflows move pipeline stages
+  # (create_opportunity steps) and their target stage ids: the stage-move map.
+  base="${OUT_DIR}/${LOC}"
+  [[ -d "$base" ]] || { echo "no harvest dir at $base" >&2; exit 2; }
+  python3 - "$base" <<'PY'
+import json, glob, os, sys
+from collections import Counter
+base = sys.argv[1]
+stage_targets = Counter()
+movers = []
+for gf in sorted(glob.glob(os.path.join(base, "*.graph.json"))):
+    wid = os.path.basename(gf).split(".")[0]
+    df = os.path.join(base, f"{wid}.detail.json")
+    name = "?"
+    try:
+        name = json.load(open(df)).get("name", "?")
+    except Exception:
+        pass
+    try:
+        graph = json.load(open(gf))
+    except Exception:
+        continue
+    steps = graph.get("steps") or graph.get("templates") or (graph if isinstance(graph, list) else [])
+    moves = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        if (s.get("type") or s.get("actionType")) == "create_opportunity":
+            attrs = s.get("attributes") or s.get("config") or {}
+            sid = attrs.get("pipeline_stage_id", "?")
+            stage_targets[sid] += 1
+            moves.append((s.get("name", ""), sid))
+    if moves:
+        movers.append((name, moves))
+print(f"{len(movers)} of the harvested workflows move a pipeline stage.\n")
+for name, moves in movers:
+    print(f"* {name}  ({len(moves)} stage-move step(s))")
+    for label, sid in moves:
+        print(f"    -> {sid}  {label}")
+print("\nDistinct target stage ids (count = times a create_opportunity targets it):")
+for sid, n in stage_targets.most_common():
+    print(f"  {n:>3}  {sid}")
+PY
+  ;;
+
+schema)
+  # Discover GHL's real step-type vocabulary and where each type stores its
+  # config: per type, how many steps / workflows use it and the union of
+  # attribute key PATHS with redacted sample values.
+  #   schema <locationId> [stepType]
+  base="${OUT_DIR}/${LOC}"
+  [[ -d "$base" ]] || { echo "no harvest dir at $base" >&2; exit 2; }
+  python3 - "$SCRIPT_DIR" "$base" "${WF_OVERRIDE:-}" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+from collections import Counter, defaultdict
+
+base, only = sys.argv[2], sys.argv[3]
+samples_max = 5 if only else 2
+
+step_n = Counter()
+wf_n = Counter()
+paths = defaultdict(lambda: defaultdict(list))   # type -> path -> samples
+
+for wid, detail, steps in iter_workflows(base):
+    seen = set()
+    for s in steps:
+        t = step_type(s)
+        if only and t != only:
+            continue
+        step_n[t] += 1
+        seen.add(t)
+        for path, val in deep_iter(attrs_of(s)):
+            key = collapse_path(path)
+            bucket = paths[t][key]
+            r = redact(val)
+            if r not in bucket and len(bucket) < samples_max:
+                bucket.append(r)
+    for t in seen:
+        wf_n[t] += 1
+
+print(f"step types across {len(list(workflow_ids(base)))} workflow(s)"
+      + (f" (filtered to type '{only}')" if only else "") + "\n")
+for t, n in step_n.most_common():
+    print(f"=== {t}   steps={n}  workflows={wf_n[t]}")
+    for key in sorted(paths[t]):
+        vals = ", ".join(json.dumps(v) for v in paths[t][key])
+        print(f"    {key}   ::  {cut(vals, 200)}")
+    print()
+print("type list (type=steps/workflows):")
+print("  " + "  ".join(f"{t}={step_n[t]}/{wf_n[t]}" for t, _ in step_n.most_common()))
+PY
+  ;;
+
+inventory)
+  # Full inventory of every harvested workflow, one row each, with a
+  # relevance CLASS derived from an ANCHOR workflow: the one workflow you know
+  # is part of the process you are auditing. Its custom-field ids, tags, stage
+  # ids and trigger form ids become the seed sets that every other workflow is
+  # scored against.
+  #   inventory <locationId> --anchor "<workflow name>" [--md]
+  #                          [--core-names "A,B"] [--process-regex RE]
+  #                          [--expect-count N] [--require-core "A,B,C"]
+  #                          [--only CLASS,CLASS] [--grep SUBSTR] [--footer-only]
+  #   --anchor is required and matches on a normalized substring of the name.
+  #   Classification always runs over ALL rows; --only/--grep/--footer-only just
+  #   narrow what gets printed (the footer counts stay whole-location).
+  base="${OUT_DIR}/${LOC}"
+  [[ -d "$base" ]] || { echo "no harvest dir at $base" >&2; exit 2; }
+  python3 - "$SCRIPT_DIR" "$base" "${@:3}" <<'PY'
+import sys, re
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+
+base = sys.argv[2]
+args = sys.argv[3:]
+as_md = "--md" in args
+footer_only = "--footer-only" in args
+expect = None
+require = []
+only = None
+grep = None
+anchor = None
+core_names = []
+process_regex = None
+i = 0
+while i < len(args):
+    if args[i] == "--anchor" and i + 1 < len(args):
+        anchor = args[i + 1]; i += 2; continue
+    if args[i] == "--core-names" and i + 1 < len(args):
+        core_names = [x.strip() for x in args[i + 1].split(",") if x.strip()]; i += 2; continue
+    if args[i] == "--process-regex" and i + 1 < len(args):
+        process_regex = args[i + 1]; i += 2; continue
+    if args[i] == "--expect-count" and i + 1 < len(args):
+        expect = int(args[i + 1]); i += 2; continue
+    if args[i] == "--require-core" and i + 1 < len(args):
+        require = [x.strip() for x in args[i + 1].split(",") if x.strip()]; i += 2; continue
+    if args[i] == "--only" and i + 1 < len(args):
+        only = {x.strip().upper() for x in args[i + 1].split(",") if x.strip()}; i += 2; continue
+    if args[i] == "--grep" and i + 1 < len(args):
+        grep = args[i + 1].lower(); i += 2; continue
+    i += 1
+
+if not anchor:
+    print('ERROR: --anchor "<workflow name>" is required.\n'
+          "  The anchor is the one workflow you know belongs to the process you\n"
+          "  are auditing; its fields, tags, stages and form ids seed the\n"
+          "  classifier. Names match on a normalized substring, so a fragment\n"
+          "  is enough. List the names you harvested with:  tree <locationId>",
+          file=sys.stderr)
+    raise SystemExit(64)
+
+if process_regex:
+    try:
+        re.compile(process_regex)
+    except re.error as exc:
+        print(f"ERROR: --process-regex is not a valid regex ({exc})", file=sys.stderr)
+        raise SystemExit(64)
+
+
+def match_any(name, pat):
+    return bool(re.search(pat, (name or "").lower()) or re.search(pat, norm_name(name)))
+
+
+# ---- gather features once per workflow -----------------------------------
+rows = []
+broken = []
+for wid, detail, steps in iter_workflows(base):
+    if detail is None:
+        broken.append((wid, "detail.json missing/unparseable"))
+    if not graph_ok(base, wid):
+        broken.append((wid, "graph.json missing/unparseable"))
+    d = detail or {}
+    conds = field_conditions_of(steps)
+    trig = load_triggers(base, wid)
+    added, removed = tags_of(steps)
+    rows.append(dict(
+        wid=wid,
+        name=d.get("name") or "(unknown)",
+        status=d.get("status") or "?",
+        dv=d.get("dataVersion", "?"),
+        trig=trigger_summary(trig) if trig is not None else "—",
+        forms=trigger_form_ids(trig) if trig is not None else set(),
+        nsteps=len(steps),
+        types=type_counts(steps),
+        cond_fields=set(conds),
+        cond_values=conds,
+        write_fields=field_writes_of(steps) | field_reads_of(steps),
+        added=added, removed=removed,
+        hosts=hosts_of(steps),
+        stages=stages_of(steps),
+        has_wait=has_type(steps, WAIT_TYPES),
+        has_send=has_type(steps, SEND_TYPES),
+        has_opp=has_type(steps, {"create_opportunity"}),
+    ))
+
+# ---- pass 1: seeds from the anchor workflow ------------------------------
+anchor_key = norm_name(anchor)
+seed = next((r for r in rows if anchor_key and anchor_key in norm_name(r["name"])), None)
+if seed is None:
+    print(f"ERROR: no harvested workflow name contains --anchor {anchor!r}.\n"
+          f"  {len(rows)} workflow(s) were read from {base}.\n"
+          "  Matching is on a normalized name (lowercase, non-alphanumerics\n"
+          "  stripped), so check spelling or pass a shorter fragment.",
+          file=sys.stderr)
+    raise SystemExit(65)
+
+SEED_FIELDS = set(seed["cond_fields"]) | set(seed["write_fields"])
+SEED_TAGS = set(seed["added"]) | set(seed["removed"])
+SEED_STAGES = set(seed["stages"])
+SEED_FORM = set(seed["forms"])
+
+# The anchor is CORE by definition; --core-names names any others you already
+# know belong to the process.
+CORE_NAMES = {norm_name(x) for x in core_names} | {norm_name(seed["name"])}
+
+# ---- pass 2: ordered rules, first match wins -----------------------------
+for r in rows:
+    f_hits = (set(r["cond_fields"]) | set(r["write_fields"])) & SEED_FIELDS
+    t_hits = (set(r["added"]) | set(r["removed"])) & SEED_TAGS
+    s_hits = set(r["stages"]) & SEED_STAGES
+    o_hits = set(r["forms"]) & SEED_FORM
+    ev = []
+    if f_hits:
+        ev.append("field:" + joinset(f_hits, 3))
+    if t_hits:
+        ev.append("tag:" + joinset(t_hits, 3))
+    if s_hits:
+        ev.append("stage:" + joinset(s_hits, 2))
+    if o_hits:
+        ev.append("form:" + joinset(o_hits, 1))
+    touches = bool(f_hits or t_hits or s_hits or o_hits)
+    writes_seed = bool(set(r["write_fields"]) & SEED_FIELDS)
+    nn = norm_name(r["name"])
+
+    if nn in CORE_NAMES:
+        r["cls"], r["ev"] = "CORE", "named-core; " + ("; ".join(ev) or "no seed overlap")
+    elif process_regex and match_any(r["name"], process_regex) and touches:
+        r["cls"], r["ev"] = "CORE", "name+seed: " + "; ".join(ev)
+    elif writes_seed:
+        r["cls"], r["ev"] = "CORE", "writes seed field: " + joinset(
+            set(r["write_fields"]) & SEED_FIELDS, 3)
+    elif match_any(r["name"], r"remind|nudge"):
+        r["cls"], r["ev"] = "REMINDER", "name; " + ("; ".join(ev) or "no seed overlap")
+    elif r["has_wait"] and r["has_send"] and (t_hits or f_hits):
+        r["cls"], r["ev"] = "REMINDER", "wait+send+seed: " + "; ".join(ev)
+    elif match_any(r["name"],
+                   r"follow ?-?up|resched|no.?show|rebook|reactivat"):
+        r["cls"], r["ev"] = "FOLLOWUP", "name; " + ("; ".join(ev) or "no seed overlap")
+    elif touches:
+        r["cls"], r["ev"] = "ADJACENT", "; ".join(ev)
+    else:
+        r["cls"], r["ev"] = "UNRELATED", ""
+
+ORDER = {"CORE": 0, "REMINDER": 1, "FOLLOWUP": 2, "ADJACENT": 3,
+         "UNRELATED": 4}
+rows.sort(key=lambda r: (ORDER.get(r["cls"], 9), r["name"].lower()))
+
+HEAD = ["id", "name", "status", "dv", "trigger", "steps", "top types", "fields",
+        "tags +/-", "hosts", "stages", "class", "evidence"]
+
+
+def cells(r, md):
+    fields = []
+    if r["cond_fields"]:
+        fields.append("cond:" + joinset(r["cond_fields"], 8 if md else 3))
+    if r["write_fields"]:
+        fields.append("write:" + joinset(r["write_fields"], 8 if md else 3))
+    tags = "+{} / -{}".format(joinset(r["added"], 6 if md else 2),
+                              joinset(r["removed"], 6 if md else 2))
+    top = ",".join(f"{t}:{n}" for t, n in r["types"].most_common(4))
+    return [r["wid"] if md else r["wid"][:8],
+            r["name"], r["status"], r["dv"], r["trig"], r["nsteps"], top,
+            " ".join(fields) or "—", tags,
+            joinset(r["hosts"], 6 if md else 2),
+            joinset(r["stages"], 6 if md else 1),
+            r["cls"],
+            r["ev"] if md else cut(r["ev"], 80)]
+
+
+shown = [r for r in rows
+         if (only is None or r["cls"] in only)
+         and (grep is None or grep in r["name"].lower())]
+if footer_only:
+    print(f"(table suppressed by --footer-only; {len(shown)} row(s) would print)")
+elif as_md:
+    print(md_table(HEAD, [cells(r, True) for r in shown]))
+else:
+    print(fixed_table(HEAD, [cells(r, False) for r in shown],
+                      [8, 46, 9, 3, 10, 5, 34, 30, 30, 18, 12, 16, 80]))
+
+# ---- footer --------------------------------------------------------------
+from collections import Counter
+dist = Counter(r["cls"] for r in rows)
+print(f"\n{len(rows)} workflow(s).")
+print("class distribution: " + ", ".join(f"{k}={dist[k]}" for k in
+      sorted(dist, key=lambda k: ORDER.get(k, 9))))
+n_opp = sum(1 for r in rows if r["has_opp"])
+print(f"workflows containing create_opportunity: {n_opp}")
+print(f"triggers on disk: {sum(1 for r in rows if r['trig'] != '—')}/{len(rows)}"
+      "  (run harvest-triggers to populate)")
+print(f"\nanchor workflow: {seed['name']} ({seed['wid']})")
+print("  SEED_FIELDS: " + joinset(SEED_FIELDS, 30, ", "))
+print("  SEED_TAGS:   " + joinset(SEED_TAGS, 40, ", "))
+print("  SEED_STAGES: " + joinset(SEED_STAGES, 20, ", "))
+print("  SEED_FORM:   " + joinset(SEED_FORM, 5, ", "))
+if broken:
+    print("\nunreadable snapshots:")
+    for wid, why in broken:
+        print(f"  {wid}  {why}")
+
+rc = 0
+if expect is not None and len(rows) != expect:
+    print(f"\nFAIL --expect-count: {len(rows)} != {expect}", file=sys.stderr)
+    rc = 2
+if require:
+    have = {norm_name(r["name"]): r for r in rows}
+    for want in require:
+        r = have.get(norm_name(want))
+        if r is None:
+            print(f"FAIL --require-core: no workflow named {want!r}", file=sys.stderr)
+            rc = rc or 3
+        elif r["cls"] != "CORE":
+            print(f"FAIL --require-core: {want!r} classed {r['cls']}", file=sys.stderr)
+            rc = rc or 3
+raise SystemExit(rc)
+PY
+  ;;
+
+fields)
+  # Every custom-field id the location's workflows touch, plus the merge tokens
+  # they interpolate. The field ids are what get remapped on clone, so this is
+  # the map you diff another sub-account against.
+  #   fields <locationId> [--md] [--min-wf N] [--section fields|tokens|both]
+  base="${OUT_DIR}/${LOC}"
+  [[ -d "$base" ]] || { echo "no harvest dir at $base" >&2; exit 2; }
+  python3 - "$SCRIPT_DIR" "$base" "${@:3}" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+from collections import Counter, defaultdict
+
+base = sys.argv[2]
+args = sys.argv[3:]
+as_md = "--md" in args
+min_wf = 1
+section = "both"
+i = 0
+while i < len(args):
+    if args[i] == "--min-wf" and i + 1 < len(args):
+        min_wf = int(args[i + 1]); i += 2; continue
+    if args[i] == "--section" and i + 1 < len(args):
+        section = args[i + 1]; i += 2; continue
+    i += 1
+
+roles = defaultdict(set)          # field id -> {"cond","write","token"}
+wfs = defaultdict(set)            # field id -> workflow names
+values = defaultdict(set)         # field id -> tested condition values
+titles = {}                       # field id -> human title
+tok_count = Counter()
+tok_wfs = defaultdict(set)
+
+for wid, detail, steps in iter_workflows(base):
+    name = (detail or {}).get("name") or wid
+    for fid, vals in field_conditions_of(steps).items():
+        roles[fid].add("cond"); wfs[fid].add(name); values[fid] |= vals
+    for fid in field_writes_of(steps):
+        roles[fid].add("write"); wfs[fid].add(name)
+    for fid in field_reads_of(steps):
+        roles[fid].add("read"); wfs[fid].add(name)
+    for fid, t in field_titles_of(steps).items():
+        titles.setdefault(fid, t)
+    for tok in tokens_of(steps):
+        tok_count[tok] += 1
+        tok_wfs[tok].add(name)
+
+
+def role_label(s):
+    if s == {"cond", "write"} or s >= {"cond", "write"}:
+        return "both"
+    return "/".join(sorted(s))
+
+
+ordered = sorted(roles, key=lambda f: (-len(wfs[f]), f))
+rows = [[fid, titles.get(fid, "—"), role_label(roles[fid]), len(wfs[fid]),
+         joinset(wfs[fid], 6, "; "), joinset(values[fid], 8, " ")]
+        for fid in ordered if len(wfs[fid]) >= min_wf]
+
+HEAD = ["field id", "title", "role", "#wf", "workflows", "values tested"]
+if section in ("both", "fields"):
+    print(f"== custom fields ({len(roles)} distinct id(s); showing "
+          f"{len(rows)} with >= {min_wf} workflow(s)) ==")
+    if as_md:
+        print(md_table(HEAD, rows))
+    else:
+        print(fixed_table(HEAD, rows, [22, 26, 6, 4, 70, 90]))
+    shared = sum(1 for f in roles if len(wfs[f]) > 1)
+    print(f"\n{shared} field id(s) are referenced by more than one workflow.")
+
+if section in ("both", "tokens"):
+    THEAD = ["merge token", "count", "workflows"]
+    trows = [[t, n, joinset(tok_wfs[t], 4, "; ")] for t, n in tok_count.most_common()]
+    print(f"\n== merge tokens ({len(trows)} distinct) ==")
+    if as_md:
+        print(md_table(THEAD, trows))
+    else:
+        print(fixed_table(THEAD, trows, [56, 5, 80]))
+PY
+  ;;
+
+flow)
+  # Linearized narrative of ONE workflow: every step with its type-specific key
+  # params, indented by parentKey depth, with each if_else branch's conditions.
+  #   flow <locationId> <workflowId>
+  wf="${WF_OVERRIDE:?usage: flow <locationId> <workflowId>}"
+  base="${OUT_DIR}/${LOC}"
+  [[ -f "${base}/${wf}.graph.json" ]] || { echo "no saved graph for $wf in $base" >&2; exit 2; }
+  python3 - "$SCRIPT_DIR" "$base" "$wf" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+
+base, wf = sys.argv[2], sys.argv[3]
+detail, steps = load_workflow(base, wf)
+d = detail or {}
+trig = load_triggers(base, wf)
+print(f"{d.get('name','?')}  [{wf}]")
+print(f"  status={d.get('status','?')}  dataVersion={d.get('dataVersion','?')}  "
+      f"steps={len(steps)}")
+print(f"  trigger: {trigger_summary(trig, 4) if trig is not None else '— (run harvest-triggers)'}")
+print()
+
+depths = depth_map(steps)
+for i, s in enumerate(steps):
+    ind = "  " * min(depths.get(s.get("id"), 0), 8)
+    typ = step_type(s)
+    print(f"{ind}[{i}] {typ} | {redact(s.get('name') or '')}"
+          + (f" | {key_params(s)}" if key_params(s) else ""))
+    if typ == "if_else":
+        by_branch = {}
+        for c in conditions_of(s):
+            by_branch.setdefault(c["branch"], []).append(c)
+        for bname, cs in by_branch.items():
+            print(f"{ind}   └─ branch {bname!r}: " + " AND ".join(fmt_condition(c) for c in cs))
+        a = attrs_of(s)
+        empties = [b.get("name") for b in (a.get("branches") or [])
+                   if isinstance(b, dict) and b.get("name") not in by_branch]
+        if empties:
+            print(f"{ind}   └─ branches with no conditions: " + ", ".join(map(str, empties)))
+        if a.get("noneBranchName"):
+            print(f"{ind}   └─ else branch: {a['noneBranchName']!r}")
+PY
+  ;;
+
+triggers)
+  # Print harvested triggers for one or all workflows.
+  #   triggers <locationId> [<workflowId>]
+  base="${OUT_DIR}/${LOC}"
+  [[ -d "$base" ]] || { echo "no harvest dir at $base" >&2; exit 2; }
+  python3 - "$SCRIPT_DIR" "$base" "${WF_OVERRIDE:-}" <<'PY'
+import sys, os
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+
+base, only = sys.argv[2], sys.argv[3]
+found = 0
+for wid, detail, _steps in iter_workflows(base):
+    if only and wid != only:
+        continue
+    doc = load_triggers(base, wid)
+    if doc is None:
+        continue
+    found += 1
+    print(f"{(detail or {}).get('name','?')}  [{wid}]")
+    rows = trigger_rows(doc)
+    if not rows:
+        print("  (triggers file present but no recognizable trigger objects)")
+    for ttype, tname, filters in rows:
+        print(f"  - {ttype}" + (f"  {tname!r}" if tname else ""))
+        for key, val in filters[:20]:
+            print(f"      {key} = {json.dumps(val)}")
+        if len(filters) > 20:
+            print(f"      (+{len(filters)-20} more keys)")
+    print()
+if not found:
+    print("no <workflowId>.triggers.json on disk for this location.")
+    print("run:  ./harvest_workflows.sh harvest-triggers " + os.path.basename(base))
+PY
+  ;;
+
+harvest-triggers)
+  # GET-only second hop for the trigger definitions. The detail response's
+  # triggersFilePath is a signed Firebase link like fileUrl; re-fetch detail so
+  # the signature is fresh, then follow it.
+  #   harvest-triggers <locationId> [<workflowId> ...]
+  dest="${OUT_DIR}/${LOC}"
+  [[ -d "$dest" ]] || { echo "no harvest dir at $dest (harvest first)" >&2; exit 2; }
+  IDS=()
+  if [[ -n "${3:-}" ]]; then
+    IDS=("${@:3}")
+  else
+    # bash 3.2 on macOS has no mapfile
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && IDS+=("$line")
+    done < <(python3 - "$SCRIPT_DIR" "$dest" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+for wid in workflow_ids(sys.argv[2]):
+    print(wid)
+PY
+)
+  fi
+  echo "fetching triggers for ${#IDS[@]} workflow(s) -> $dest"
+  saved=0; failed=0
+  for id in "${IDS[@]}"; do
+    sleep "$SLEEP_BETWEEN"
+    tmp_d="$(mktemp)"
+    c="$(ghl_get "${BASE}/${LOC}/${id}?includeScheduledPauseInfo=true" "$tmp_d" "${DETAIL_HEADERS[@]}")"
+    if [[ "$c" == "401" ]]; then
+      echo "401: token expired, refresh GHL_TOKEN_ID (see AUTH)" >&2
+      exit 4
+    fi
+    if [[ "$c" != "200" ]]; then
+      failed=$((failed+1)); echo "  $id detail -> HTTP $c" >&2; continue
+    fi
+    # Print the SHAPE of both paths (hostname + path skeleton, no signature) so
+    # the relative-vs-absolute question is answerable from the transcript.
+    read -r shape_file shape_trig trig_url < <(python3 - "$SCRIPT_DIR" "$tmp_d" <<'PY'
+import sys, re
+sys.path.insert(0, sys.argv[1])
+from wf_lib import *  # noqa
+from urllib.parse import urlparse, quote
+d = load_json(sys.argv[2]) or {}
+fu = d.get("fileUrl") or ""
+tp = d.get("triggersFilePath") or ""
+def shape(u):
+    if not u:
+        return "-"
+    if URLISH_RE.match(u):
+        p = urlparse(u)
+        return f"{p.hostname}{re.sub(r'[^/]+', '*', p.path)}"
+    return "relative:" + re.sub(r"[^/]+", "*", u)
+# fileUrl is a Firebase Storage download link:
+#   https://firebasestorage.googleapis.com/v0/b/<bucket>/o/<pct-encoded path>?alt=media&token=…
+# triggersFilePath is the same bucket's OBJECT PATH, unencoded. So keep
+# everything up to and including "/o/", percent-encode the triggers path as one
+# segment, and reuse fileUrl's query (alt=media + download token).
+if not tp:
+    url = "-"
+elif URLISH_RE.match(tp):
+    url = tp
+elif fu and "/o/" in fu:
+    prefix = fu.split("/o/", 1)[0] + "/o/"
+    q = urlparse(fu).query
+    url = prefix + quote(tp.lstrip("/"), safe="") + (f"?{q}" if q else "")
+else:
+    url = "-"
+print(shape(fu), shape(tp), url)
+PY
+)
+    echo "  $id  fileUrl=$shape_file  triggersFilePath=$shape_trig"
+    if [[ "$trig_url" == "-" ]]; then
+      failed=$((failed+1)); echo "  $id: no triggersFilePath in detail" >&2; continue
+    fi
+    sleep "$SLEEP_BETWEEN"
+    tc="$(curl -sS -o "${dest}/${id}.triggers.json" -w '%{http_code}' "$trig_url")"
+    if [[ "$tc" == "200" ]]; then
+      saved=$((saved+1))
+    else
+      failed=$((failed+1))
+      rm -f "${dest}/${id}.triggers.json"
+      echo "  $id triggers -> HTTP $tc" >&2
+    fi
+  done
+  echo "done: $saved saved, $failed failed"
+  ;;
+
+*)
+  echo "Unknown mode '$MODE' (expected: probe | tree | harvest | inspect |" \
+       "inspect-full | inspect-raw | summary | schema | inventory | fields |" \
+       "flow | triggers | harvest-triggers)" >&2
+  exit 64
+  ;;
+esac
+GHL_MAPPER_EOF
+cat > "$ROOT/scripts/bash/wf_lib.py" <<'GHL_MAPPER_EOF'
+"""Shared helpers for the GHL workflow harvester's analysis modes.
+
+Imported by the inline python3 heredocs inside harvest_workflows.sh. The bash
+side passes the script directory as argv[1]:
+
+    python3 - "$(cd "$(dirname "$0")" && pwd)" "<args>" <<'PY'
+    import sys; sys.path.insert(0, sys.argv[1]); from wf_lib import *
+    PY
+
+READ-ONLY: nothing here writes to GHL. It only reads the harvested snapshots
+under .ghl-workflow-snapshots/<locationId>/.
+
+Redaction policy (a transcript is not a safe place for account data):
+automation logic (step names, tag names, custom-field ids, condition values,
+stage ids) is safe to print; free text is truncated to ~60 chars and URLs are
+reduced to their hostname.
+"""
+
+import glob
+import json
+import os
+import re
+from urllib.parse import urlparse
+
+MAX_STR = 60
+
+ID_RE = re.compile(r"^[A-Za-z0-9]{20,24}$")
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+TOKEN_RE = re.compile(r"\{\{\s*(custom_values|contact|opportunity)\.[^}]+\}\}")
+URLISH_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+
+# --------------------------------------------------------------------------
+# loading
+# --------------------------------------------------------------------------
+
+def steps_of(graph):
+    """The step array of a graph doc, whatever shape GHL used."""
+    if isinstance(graph, list):
+        return [s for s in graph if isinstance(s, dict)]
+    if not isinstance(graph, dict):
+        return []
+    steps = graph.get("steps")
+    if not isinstance(steps, list):
+        steps = graph.get("templates")
+    if not isinstance(steps, list):
+        steps = []
+    return [s for s in steps if isinstance(s, dict)]
+
+
+def load_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def load_workflow(base, wid):
+    """(detail_dict_or_None, steps) for one workflow id under `base`."""
+    detail = load_json(os.path.join(base, f"{wid}.detail.json"))
+    graph = load_json(os.path.join(base, f"{wid}.graph.json"))
+    return detail, steps_of(graph) if graph is not None else []
+
+
+def workflow_ids(base):
+    ids = []
+    for gf in glob.glob(os.path.join(base, "*.graph.json")):
+        ids.append(os.path.basename(gf)[: -len(".graph.json")])
+    return sorted(ids)
+
+
+def iter_workflows(base):
+    """Yield (wid, detail_or_None, steps) sorted by workflow name."""
+    rows = []
+    for wid in workflow_ids(base):
+        detail, steps = load_workflow(base, wid)
+        name = (detail or {}).get("name") or ""
+        rows.append((name.lower(), wid, detail, steps))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    for _, wid, detail, steps in rows:
+        yield wid, detail, steps
+
+
+def graph_ok(base, wid):
+    """False when the graph file is missing or unparseable."""
+    p = os.path.join(base, f"{wid}.graph.json")
+    return os.path.exists(p) and load_json(p) is not None
+
+
+def load_triggers(base, wid):
+    return load_json(os.path.join(base, f"{wid}.triggers.json"))
+
+
+# --------------------------------------------------------------------------
+# traversal / redaction
+# --------------------------------------------------------------------------
+
+def deep_iter(obj, path=()):
+    """Yield (path_tuple, leaf_value) for every scalar leaf in obj.
+
+    List indices appear in the path as the integer index; use collapse_path()
+    to render them as '[]'.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from deep_iter(v, path + (str(k),))
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            yield from deep_iter(v, path + (i,))
+    else:
+        yield path, obj
+
+
+def collapse_path(path):
+    """('branches', 0, 'name') -> 'branches[].name'"""
+    out = []
+    for seg in path:
+        if isinstance(seg, int):
+            if out:
+                out[-1] = out[-1] + "[]"
+            else:
+                out.append("[]")
+        else:
+            out.append(seg)
+    return ".".join(out)
+
+
+def redact(value):
+    """Truncate long strings; reduce URLs to a hostname. Non-strings pass."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if URLISH_RE.match(s):
+        try:
+            host = urlparse(s).hostname
+        except Exception:
+            host = None
+        if host:
+            return f"<url {host}>"
+    s = " ".join(value.split())
+    if len(s) > MAX_STR:
+        return s[:MAX_STR] + "…"
+    return s
+
+
+def redact_deep(obj, path=()):
+    """Copy of obj with secret-bearing keys blanked and every string redacted.
+
+    Used by inspect-raw so a full step dump never carries a webhook header
+    value, an access token or a full URL into a transcript.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            p = path + (str(k),)
+            out[k] = "<redacted>" if is_secret_path(collapse_path(p)) else redact_deep(v, p)
+        return out
+    if isinstance(obj, list):
+        return [redact_deep(v, path + (0,)) for v in obj]
+    return redact(obj)
+
+
+def norm_name(s):
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def step_type(step):
+    return step.get("type") or step.get("actionType") or "?"
+
+
+def attrs_of(step):
+    a = step.get("attributes")
+    if not isinstance(a, dict):
+        a = step.get("config")
+    return a if isinstance(a, dict) else {}
+
+
+# --------------------------------------------------------------------------
+# conditions
+# --------------------------------------------------------------------------
+
+def conditions_of(step):
+    """Flat list of every branch condition on a step.
+
+    Grounded in `schema`: if_else keeps them at
+    attributes.branches[].segments[].conditions[]; a `wait` step with a
+    condition keeps the same shape one level deeper, under
+    attributes.condition.branches[]. So we recurse for any object carrying a
+    `segments` list (a branch) and collect every `conditions` list found.
+    """
+    out = []
+
+    def walk(obj, bname):
+        if isinstance(obj, dict):
+            if isinstance(obj.get("segments"), list):
+                bname = obj.get("name") or obj.get("id") or bname
+            conds = obj.get("conditions")
+            if isinstance(conds, list):
+                for c in conds:
+                    if isinstance(c, dict) and (
+                        "conditionType" in c or "conditionOperator" in c
+                    ):
+                        out.append(_cond_row(bname, c))
+            for k, v in obj.items():
+                if k == "conditions":
+                    continue
+                walk(v, bname)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v, bname)
+
+    walk(attrs_of(step), "(step)")
+    return out
+
+
+def _cond_row(branch, c):
+    return {
+        "branch": branch,
+        "conditionType": c.get("conditionType"),
+        "conditionSubType": c.get("conditionSubType"),
+        "conditionOperator": c.get("conditionOperator"),
+        "conditionValue": c.get("conditionValue"),
+    }
+
+
+def jd(v):
+    return json.dumps(v, ensure_ascii=False)
+
+
+def fmt_condition(c):
+    return "{}:{} {} {}".format(
+        c.get("conditionType"),
+        c.get("conditionSubType"),
+        c.get("conditionOperator"),
+        jd(redact(c.get("conditionValue"))),
+    )
+
+
+# --------------------------------------------------------------------------
+# feature extraction
+#
+# Every type name and attribute path below was read off `schema` output from a
+# real account rather than guessed; re-verify with `schema` on yours. The extra
+# names in each set are forward-compat only.
+# --------------------------------------------------------------------------
+
+TAG_ADD_TYPES = {"add_contact_tag"}
+TAG_REMOVE_TYPES = {"remove_contact_tag"}
+TAG_TYPES = TAG_ADD_TYPES | TAG_REMOVE_TYPES
+# a "send" is anything that emits a message to a human
+SEND_TYPES = {"sms", "email", "internal_notification", "sendblue_outbound_message",
+              "slack_message", "ivr_connect_call", "manual-call", "manual_sms",
+              "whatsapp", "voicemail", "gmb_messaging", "review_request"}
+WAIT_TYPES = {"wait", "wait_for_reply"}
+TASK_TYPES = {"create_task", "add_task", "task"}
+WEBHOOK_TYPES = {"webhook", "custom_webhook", "inbound_webhook"}
+FIELD_WRITE_TYPES = {"update_contact_field", "math_operation"}
+OPP_TYPES = {"create_opportunity", "remove_opportunity"}
+STAGE_TYPES = {"create_opportunity"}
+# attributes.headers[].value on a webhook step holds an API key: never print it
+SECRET_PATHS = ("headers[].value", "access_token", "token", "apikey", "api_key",
+                "secret", "password")
+
+
+def has_type(steps, types):
+    types = {t.lower() for t in types}
+    return any(step_type(s).lower() in types for s in steps)
+
+
+def steps_of_type(steps, types):
+    types = {t.lower() for t in types}
+    return [s for s in steps if step_type(s).lower() in types]
+
+
+def _string_leaves(obj):
+    for path, v in deep_iter(obj):
+        if isinstance(v, str) and v:
+            yield collapse_path(path), v
+
+
+def is_secret_path(key):
+    kl = key.lower()
+    return any(p in kl for p in SECRET_PATHS)
+
+
+def _tag_list(step):
+    tags = attrs_of(step).get("tags")
+    if isinstance(tags, list):
+        return {t for t in tags if isinstance(t, str) and t}
+    if isinstance(tags, str) and tags:
+        return {tags}
+    return set()
+
+
+def tags_of(steps):
+    """(tags_added, tags_removed), from add/remove_contact_tag attributes.tags[]."""
+    added, removed = set(), set()
+    for s in steps:
+        t = step_type(s).lower()
+        if t in TAG_ADD_TYPES:
+            added |= _tag_list(s)
+        elif t in TAG_REMOVE_TYPES:
+            removed |= _tag_list(s)
+    return added, removed
+
+
+def _is_field_id(v):
+    return isinstance(v, str) and bool(ID_RE.match(v) or UUID_RE.match(v))
+
+
+def field_writes_of(steps):
+    """Custom-field ids a workflow WRITES.
+
+    update_contact_field -> attributes.fields[].field
+    math_operation       -> attributes.updateField
+    """
+    out = set()
+    for s in steps:
+        t = step_type(s).lower()
+        a = attrs_of(s)
+        if t == "update_contact_field":
+            for f in a.get("fields") or []:
+                if isinstance(f, dict) and _is_field_id(f.get("field")):
+                    out.add(f["field"])
+        elif t == "math_operation":
+            if _is_field_id(a.get("updateField")):
+                out.add(a["updateField"])
+    return out
+
+
+def field_titles_of(steps):
+    """{field_id: human title}, from update_contact_field fields[].title."""
+    out = {}
+    for s in steps:
+        if step_type(s).lower() != "update_contact_field":
+            continue
+        for f in attrs_of(s).get("fields") or []:
+            if isinstance(f, dict) and _is_field_id(f.get("field")) and f.get("title"):
+                out.setdefault(f["field"], redact(f["title"]))
+    return out
+
+
+def field_write_values_of(steps):
+    """{field_id: set(redacted values written)}."""
+    out = {}
+    for s in steps:
+        if step_type(s).lower() != "update_contact_field":
+            continue
+        for f in attrs_of(s).get("fields") or []:
+            if isinstance(f, dict) and _is_field_id(f.get("field")):
+                out.setdefault(f["field"], set()).add(
+                    json.dumps(redact(f.get("value")))
+                )
+    return out
+
+
+def field_reads_of(steps):
+    """math_operation.selectField, a field read as the arithmetic source."""
+    out = set()
+    for s in steps:
+        if step_type(s).lower() == "math_operation":
+            v = attrs_of(s).get("selectField")
+            if _is_field_id(v):
+                out.add(v)
+    return out
+
+
+def field_conditions_of(steps):
+    """{field_id: set(conditionValues)} for contact_detail/custom-field tests."""
+    out = {}
+    for s in steps:
+        for c in conditions_of(s):
+            ctype = str(c.get("conditionType") or "")
+            sub = c.get("conditionSubType")
+            if not isinstance(sub, str):
+                continue
+            is_field = ("contact_detail" in ctype or "custom" in ctype.lower()) or \
+                       bool(ID_RE.match(sub) or UUID_RE.match(sub))
+            if not is_field:
+                continue
+            if not (ID_RE.match(sub) or UUID_RE.match(sub)):
+                continue
+            out.setdefault(sub, set()).add(json.dumps(redact(c.get("conditionValue"))))
+    return out
+
+
+def stages_of(steps):
+    """pipeline_stage_ids targeted by create_opportunity steps."""
+    out = set()
+    for s in steps:
+        if step_type(s).lower() not in STAGE_TYPES:
+            continue
+        v = attrs_of(s).get("pipeline_stage_id")
+        if _is_field_id(v):
+            out.add(v)
+    return out
+
+
+def host_of(url):
+    if not isinstance(url, str) or not URLISH_RE.match(url.strip()):
+        return None
+    try:
+        return urlparse(url.strip()).hostname
+    except Exception:
+        return None
+
+
+def hosts_of(steps):
+    """Hostnames of webhook/HTTP targets (attributes.url on a webhook step)."""
+    out = set()
+    for s in steps:
+        for key, v in _string_leaves(attrs_of(s)):
+            if is_secret_path(key):
+                continue
+            h = host_of(v)
+            if h:
+                out.add(h)
+    return out
+
+
+def type_counts(steps):
+    from collections import Counter
+    return Counter(step_type(s) for s in steps)
+
+
+def tokens_of(steps):
+    """Merge tokens ({{contact.x}} etc.) found in any string leaf of a step."""
+    out = set()
+    for s in steps:
+        for key, v in _string_leaves(s):
+            if is_secret_path(key):
+                continue
+            for m in TOKEN_RE.finditer(v):
+                out.add(" ".join(m.group(0).split()))
+    return out
+
+
+# --------------------------------------------------------------------------
+# graph structure: steps carry id / name / type / order / parentKey / next
+# --------------------------------------------------------------------------
+
+def depth_map(steps):
+    """{step_id: depth}. parentKey points at a step id, or at a branch id
+    nested inside an if_else/wait step's branches[]; resolve both."""
+    by_id = {s.get("id"): s for s in steps if s.get("id")}
+    branch_owner = {}
+    for s in steps:
+        sid = s.get("id")
+        for path, v in deep_iter(attrs_of(s)):
+            key = collapse_path(path)
+            if key.endswith("branches[].id") or key.endswith("transitions[].id") \
+               or key.endswith("__branchKey__"):
+                if isinstance(v, str) and v:
+                    branch_owner[v] = sid
+
+    depths = {}
+
+    def depth(sid, seen=()):
+        if sid in depths:
+            return depths[sid]
+        if sid in seen or sid not in by_id:
+            return 0
+        pk = by_id[sid].get("parentKey")
+        if pk in by_id:
+            # plain sequential next-step link, same nesting level
+            d = depth(pk, seen + (sid,))
+        elif pk in branch_owner:
+            # first step inside a branch, one level deeper than the if_else
+            d = depth(branch_owner[pk], seen + (sid,)) + 1
+        else:
+            d = 0
+        depths[sid] = d
+        return d
+
+    for s in steps:
+        if s.get("id"):
+            depth(s["id"])
+    return depths
+
+
+def key_params(step):
+    """Type-specific 'what this step actually does', grounded in `schema`."""
+    t = step_type(step).lower()
+    a = attrs_of(step)
+    out = []
+
+    def add(label, val):
+        if val in (None, "", [], {}):
+            return
+        out.append(f"{label}={jd(redact(val)) if isinstance(val, str) else val}")
+
+    if t == "wait":
+        sa = a.get("startAfter") or {}
+        if sa.get("value") is not None:
+            out.append(f"after={sa.get('value')} {sa.get('type')} {sa.get('when') or ''}".strip())
+        asa = a.get("appointmentStartAfter") or {}
+        if asa.get("value") is not None:
+            out.append(f"appt={asa.get('value')} {asa.get('type')} "
+                       f"{asa.get('when') or ''}".strip())
+        w = a.get("window") or {}
+        if w.get("start") or w.get("end"):
+            out.append(f"window={w.get('start')}-{w.get('end')} days={w.get('days')}")
+        add("waitType", a.get("type"))
+        for c in conditions_of(step):
+            out.append("cond " + fmt_condition(c))
+    elif t == "wait_for_reply":
+        out.append(f"timeout={a.get('wait_amount')} {a.get('wait_unit')}")
+    elif t in TAG_TYPES:
+        verb = "removes" if t in TAG_REMOVE_TYPES else "adds"
+        out.append(f"{verb}=" + ",".join(sorted(_tag_list(step))))
+    elif t == "sms":
+        add("body", a.get("body"))
+    elif t == "sendblue_outbound_message":
+        add("content", a.get("content"))
+    elif t == "email":
+        add("subject", a.get("subject"))
+        add("from", a.get("from_email"))
+    elif t == "internal_notification":
+        add("channel", a.get("type"))
+        add("subject", ((a.get("email") or {}).get("subject")))
+        add("to", ((a.get("email") or {}).get("to")))
+        add("body", ((a.get("sms") or {}).get("body")))
+        add("to", ((a.get("sms") or {}).get("to")))
+    elif t == "slack_message":
+        add("channel", ((a.get("channel") or {}).get("name")))
+        add("text", a.get("text"))
+    elif t in TASK_TYPES:
+        add("title", a.get("title") or a.get("name"))
+    elif t in WEBHOOK_TYPES:
+        h = host_of(a.get("url") or "")
+        out.append(f"{a.get('method') or 'GET'} host={h or '?'}")
+        keys = [c.get("key") for c in (a.get("customData") or [])
+                if isinstance(c, dict) and c.get("key")]
+        if keys:
+            out.append("customData=" + ",".join(map(str, keys[:8])))
+    elif t == "update_contact_field":
+        add("actionType", a.get("actionType"))
+        for f in a.get("fields") or []:
+            if isinstance(f, dict):
+                out.append(f"{f.get('field')} ({redact(f.get('title'))}) := "
+                           f"{jd(redact(f.get('value')))}")
+    elif t == "math_operation":
+        ops = ",".join(f"{o.get('operator')} {redact(o.get('value'))}"
+                       for o in (a.get("operators") or []) if isinstance(o, dict))
+        out.append(f"{a.get('selectField')} {ops} -> {a.get('updateField')}")
+    elif t == "create_opportunity":
+        out.append(f"stage={a.get('pipeline_stage_id')} pipeline={a.get('pipeline_id')}")
+        add("status", a.get("opportunity_status"))
+        add("value", a.get("monetary_value"))
+    elif t == "remove_opportunity":
+        out.append(f"pipeline={a.get('pipeline_id')} which={a.get('opportunity_to_be_found')}")
+    elif t in ("add_to_workflow", "remove_from_workflow"):
+        wid = a.get("workflow_id")
+        out.append("workflow=" + (",".join(wid) if isinstance(wid, list) else str(wid)))
+    elif t == "goto":
+        out.append(f"target={a.get('targetNodeId')}")
+    elif t == "update_appointment_status":
+        out.append(f"status={a.get('status_type')}")
+    elif t == "update_conversation_ai_status":
+        out.append(f"ai={a.get('status')}")
+    elif t == "event_start_date":
+        add("value", a.get("value"))
+    elif t == "custom_code":
+        add("lang", a.get("language"))
+        add("code", a.get("code"))
+    elif t == "datetime_formatter":
+        out.append(f"{a.get('format', {}).get('fromFormat')} -> "
+                   f"{a.get('format', {}).get('toFormat')}")
+    elif t == "dnd_contact":
+        out.append(f"dnd={a.get('dnd_contact')} channels={a.get('specific_channels')}")
+    elif t == "facebook_conversion_api":
+        out.append(f"event={a.get('event_name')}")
+    elif t == "if_else":
+        add("label", a.get("conditionName"))
+    elif t == "ivr_connect_call":
+        out.append("outbound call")
+    return "  ".join(out)
+
+
+# --------------------------------------------------------------------------
+# triggers (only present once `harvest-triggers` has run)
+# --------------------------------------------------------------------------
+
+def trigger_list(doc):
+    """Normalize whatever shape the triggers file has into a list of dicts."""
+    if isinstance(doc, list):
+        return [t for t in doc if isinstance(t, dict)]
+    if isinstance(doc, dict):
+        for k in ("triggers", "rows", "data", "items"):
+            v = doc.get(k)
+            if isinstance(v, list):
+                return [t for t in v if isinstance(t, dict)]
+        if "type" in doc or "eventType" in doc:
+            return [doc]
+    return []
+
+
+def trigger_rows(doc):
+    """[(type, name, [(key, redacted_value), ...])] for one triggers doc."""
+    rows = []
+    for t in trigger_list(doc):
+        ttype = t.get("type") or t.get("eventType") or t.get("key") or "?"
+        tname = t.get("name") or t.get("label") or ""
+        filters = []
+        for path, v in deep_iter(t):
+            key = collapse_path(path)
+            if key in ("type", "name", "eventType", "label"):
+                continue
+            if is_secret_path(key):
+                continue
+            if v in (None, "", [], {}):
+                continue
+            filters.append((key, redact(v)))
+        rows.append((str(ttype), str(tname), filters))
+    return rows
+
+
+def trigger_summary(doc, limit=2):
+    rows = trigger_rows(doc)
+    if not rows:
+        return "—"
+    parts = [f"{t}{'/' + n if n else ''}" for t, n, _ in rows[:limit]]
+    if len(rows) > limit:
+        parts.append(f"+{len(rows)-limit}")
+    return ";".join(parts)
+
+
+def trigger_form_ids(doc):
+    """Form/survey/calendar ids a trigger is scoped to."""
+    out = set()
+    for _t, _n, filters in trigger_rows(doc):
+        for key, v in filters:
+            kl = key.lower()
+            if any(h in kl for h in ("form", "survey", "calendar")) and _is_field_id(v):
+                out.add(v)
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+def cut(s, n):
+    s = "" if s is None else str(s)
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+
+
+def md_cell(s):
+    return str("" if s is None else s).replace("|", "\\|").replace("\n", " ")
+
+
+def fixed_table(headers, rows, widths):
+    lines = []
+    lines.append("  ".join(h.ljust(w)[:w] for h, w in zip(headers, widths)))
+    lines.append("  ".join("-" * w for w in widths))
+    for r in rows:
+        lines.append("  ".join(cut(c, w).ljust(w) for c, w in zip(r, widths)))
+    return "\n".join(lines)
+
+
+def md_table(headers, rows):
+    lines = ["| " + " | ".join(headers) + " |",
+             "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        lines.append("| " + " | ".join(md_cell(c) for c in r) + " |")
+    return "\n".join(lines)
+
+
+def joinset(vals, limit=4, sep=","):
+    vals = sorted(str(v) for v in vals)
+    if not vals:
+        return "—"
+    if len(vals) <= limit:
+        return sep.join(vals)
+    return sep.join(vals[:limit]) + f"+{len(vals)-limit}"
+GHL_MAPPER_EOF
+chmod +x "$ROOT/scripts/ghl_workflow_mapper.py" "$ROOT/scripts/bash/harvest_workflows.sh"
 grep -qxF ".ghl-workflow-snapshots/" .gitignore 2>/dev/null || echo ".ghl-workflow-snapshots/" >> .gitignore
 echo "installed to $ROOT (and added .ghl-workflow-snapshots/ to .gitignore)"; ls -R "$ROOT"
