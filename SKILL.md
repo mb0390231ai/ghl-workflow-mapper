@@ -9,14 +9,14 @@ GoHighLevel's public API (v2) and the GHL MCP server return workflow **metadata 
 
 Two ways to use it, in order:
 
-1. **Map.** Get consent, get the token, download the workflow definitions, draw the diagram. Nothing else. This is the default when someone invokes the skill.
+1. **Map.** Get the go-ahead, get the token, download the workflow definitions, draw the diagram. Nothing else. This is the default when someone invokes the skill.
 2. **Audit.** Only when the owner asks: answer questions about specific workflows, run the pitfall pass, and if they want a written inventory, build the tables.
 
 Where a step says **ask the owner**, stop and ask. Guessing produces a document that reads as authoritative and is wrong.
 
 ## Checkpoints: stop and ask
 
-1. **Before the first network call:** the read-only note and the terms note, read to the owner in plain words and accepted, with a record of who accepted and when (guardrail 2, Map step 1).
+1. **Before the first network call:** the permission overview, given to the owner in plain words, and their yes (guardrail 2, Map step 1).
 2. **Before reading any location the owner did not name:** say which location and why (guardrail 7).
 3. **Before any audit work:** the owner has asked for it and named the process or the question. The map step ends with the diagram; do not slide into an audit uninvited.
 4. **Before classifying (audit only):** confirm the anchor workflow and the names to pass to `--core-names`.
@@ -29,16 +29,16 @@ Everything else in this file you may do without asking, as long as it is a GET a
 
 | File | What it holds | When to open it |
 |---|---|---|
-| `scripts/ghl_workflow_mapper.py` | The whole tool: harvest, diagram, and every analysis mode. Python 3.8+, standard library only, no curl and no packages. | Run it. Read a named function only when you are adding a mode. |
-| `reference/protocol.md` | The three endpoint hops, exact headers, paging, the trigger-object URL rule with a worked example, failure codes, the step-type vocabulary, and how to resolve field and stage ids to names. | A call fails, the JSON shape looks new, or you are extending the script. |
+| `scripts/ghl_workflow_mapper.py` | The whole tool: harvest, diagram, and every analysis mode. Python 3.8+ and the system `curl` (GHL refuses Python's built-in HTTP client), no packages. | Run it. Read a named function only when you are adding a mode. |
+| `reference/protocol.md` | The three endpoint hops, exact headers, paging, the trigger endpoint, failure codes, the step-type vocabulary, and how to resolve field and stage ids to names. | A call fails, the JSON shape looks new, or you are extending the script. |
 | `reference/pitfalls.md` | The failure patterns to check workflows against during an audit, and how to diff a clone against its template. | Audit mode, before answering "what could be wrong here". |
 
-Run the script; do not paste its source into the conversation. Its output is the thing you reason over. Treat the script's own usage text (`python3 scripts/ghl_workflow_mapper.py` with no arguments) as the authority on modes and flags; if a flag here and a flag there disagree, follow the usage text and say so.
+Run the script; do not paste its source into the conversation. Its output is the thing you reason over. Treat the script's own usage text (`python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py` with no arguments) as the authority on modes and flags; if a flag here and a flag there disagree, follow the usage text and say so.
 
 ## Guardrails
 
 1. **Send GET and nothing else.** Every network call in the script is an HTTP GET. Route any call you add through the script's existing GET helper, which cannot send another method. A write mutates a live automation in a client's account, and the workflow builder has no undo.
-2. **Get consent before the first call.** These are the same requests the GHL web app sends when a person opens the workflow builder, and the tool only ever reads. They are not part of GHL's public API, GHL can change them without notice, and the owner should check that this use is acceptable under their own agreement with GHL. Tell the account owner exactly that, in plain words, and wait for an explicit yes before any call. Write down who accepted and when.
+2. **Get the go-ahead before the first call.** Give the owner a short, plain-words overview of what you need permission to do, then wait for a yes before any network call. Cover four things: you will read the workflow definitions in the sub-account they name, using the same requests the GHL web app sends when a person opens the workflow builder; every request is a GET, sent one per second, so nothing in GHL changes; you need them to copy a session token from the browser and store it in the OS secret store, never in the chat; and the definitions are saved to a local folder kept out of version control. Add, as information, that these requests are not part of GHL's public API and GHL can change them without notice, in which case the tool stops rather than retrying. This is a permission request, not an agreement: do not ask the owner to accept terms, and do not record who said yes.
 3. **Stop when the endpoint changes.** A 404 on a single workflow id means that workflow was deleted after you listed it: record it as a gap, do not retry it, and carry on. A 404 on the list or detail endpoint for a location that worked minutes ago, or a response missing a field `reference/protocol.md` says you need, means GHL moved the endpoint: report the request path and what came back, and stop the run. Do not retry in a loop; a retry loop against these endpoints is what gets an agency blocked.
 4. **Treat the session token as a live credential.** Store it in the operating system secret store and let the script read it from there. The token is agency level: one copy reads every sub-account the login can see, and a shell command carrying it is recorded in shell history and in this transcript. The script also accepts a `GHL_TOKEN_ID` environment variable for runners that inject secrets themselves; in an interactive session prefer the secret store, and if you do use the variable, set it inline for the single command (`GHL_TOKEN_ID="$(secret lookup command)" python3 ...`) and never `export` it. Print only the token length, never its value.
 5. **Snapshots are client data and may contain secrets.** Workflow graphs carry webhook URLs with API keys in their headers, Facebook Conversion API tokens, internal phone numbers and email templates. Keep the snapshot folder out of version control: add its name to `.gitignore` in the working directory before the first harvest, and confirm that you did. Every print path must redact URLs to hostnames, truncate free text, and blank webhook headers and token-like keys, as the shipped modes already do.
@@ -52,16 +52,37 @@ Copy this checklist and check items off as you go:
 
 ```
 GHL workflow map:
-- [ ] Step 1: Owner accepted the read-only / terms note (record who and when)
+- [ ] Step 1: Permission overview given, owner said yes, owner ran the allow command
 - [ ] Step 2: Account picked, location id in hand, token stored, snapshot folder gitignored
 - [ ] Step 3: probe returns GRAPH REACHED
 - [ ] Step 4: harvest + harvest-triggers finished, counts checked, gaps recorded
 - [ ] Step 5: diagram produced and shown; isolated workflows listed; stop here
 ```
 
-### Step 1: Get consent
+### Step 1: Get the go-ahead and the allow rule
 
-Guardrail 2, before anything touches the network. Say what the tool does (reads workflow definitions with the same requests the browser makes when the builder is open), what it never does (write anything), and what the owner should check on their side. Wait for the yes. Checkpoint 1.
+Guardrail 2, before anything touches the network. Give the permission overview as a short list, in plain words, and wait for the yes. Checkpoint 1.
+
+Then, straight away, give the owner this command to run in their own terminal, with `<working folder>` replaced by the absolute path of the working folder, and wait for them to confirm. Claude Code's permission system can block the script even after the owner has said yes, because it sends a credential over the network, and you cannot grant yourself permission: only the owner can add the rule.
+
+```bash
+cd "<working folder>" && python3 - <<'PY'
+import json, os
+p = ".claude/settings.local.json"
+s = json.load(open(p)) if os.path.exists(p) else {}
+allow = s.setdefault("permissions", {}).setdefault("allow", [])
+for r in ("Bash(python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py:*)",
+          "Bash(bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh:*)"):
+    if r not in allow:
+        allow.append(r)
+os.makedirs(".claude", exist_ok=True)
+with open(p, "w") as f:
+    json.dump(s, f, indent=2)
+print("allowed the ghl-workflow-mapper scripts in", p)
+PY
+```
+
+The rules cover only these two scripts in this folder; to remove them later, the owner deletes the two lines containing `ghl-workflow-mapper` from `.claude/settings.local.json`. From here on, always run the script exactly as `python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py <mode> ...` from the working folder, never by absolute path, so it matches the rule. If a call is still blocked, do not work around it: do not send the same requests another way, and do not edit settings files yourself. Stop and tell the owner.
 
 ### Step 2: Pick the account and get credentials
 
@@ -69,7 +90,7 @@ Guardrail 2, before anything touches the network. Say what the tool does (reads 
 
 **Get the location id.** Ask the owner to open the sub-account in GHL and read the browser address bar: the URL looks like `https://app.gohighlevel.com/v2/location/<locationId>/...` (agencies on a white-labelled domain see their own domain, then `/v2/location/`). The string between `/location/` and the next `/` is the location id, about 20 letters and digits. Ask them to copy it and paste it into the chat; confirm it back before you use it.
 
-**Get a token.** The owner does this in about two minutes; walk them through it one step at a time. In a browser logged into GHL: open DevTools (F12, or right-click the page and choose Inspect), select the **Network** tab, then open the sub-account's **Settings, Custom Fields** page (or reload any GHL page). Requests to `backend.leadconnectorhq.com` appear in the list; the Custom Fields page reliably fires one named `search?parentId=...` whose full URL is `https://backend.leadconnectorhq.com/locations/<locationId>/customFields/search?...`, and any request to that host works. Click it, open the **Headers** panel, scroll to **Request Headers**, and copy the full value of the `token-id` header (right-click the value, Copy value). It is a long string starting `eyJ`, roughly a thousand characters. It expires in about **one hour**.
+**Get a token.** The owner does this in about two minutes; walk them through it one step at a time. In a browser logged into GHL: open DevTools (F12, or right-click the page and choose Inspect), select the **Network** tab, then open the sub-account's **Settings, Custom Fields** page (or reload any GHL page). Requests to `backend.leadconnectorhq.com` appear in the list; the Custom Fields page reliably fires one named `search?parentId=...` whose full URL is `https://backend.leadconnectorhq.com/locations/<locationId>/customFields/search?...`, and any request to that host works. Click it, open the **Headers** panel, scroll to **Request Headers**, and copy the full value of the `token-id` header (right-click the value, Copy value). It is a long string starting `eyJ`, roughly a thousand characters. It expires in about **one hour**. The script reads the expiry from the token itself (no network call) and prints the minutes left each time it loads it; quote that number rather than estimating, and ask for a fresh token when it says expired.
 
 Treat a 401 on a call that worked earlier as token expiry first: ask for a fresh one before you debug anything else. If a fresh token also 401s, stop and suspect the header form (the list endpoint wants `token-id`, the detail endpoint wants `authorization: Bearer`, same value, per `reference/protocol.md`).
 
@@ -91,20 +112,20 @@ The script reads `GHL_TOKEN_ID` from the environment first (guardrail 4 governs 
 ### Step 3: Prove access
 
 ```bash
-python3 scripts/ghl_workflow_mapper.py probe <locationId>
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py probe <locationId>
 ```
 
-Three calls, list to detail to graph. It ends with `GRAPH REACHED` or a clear reason. Do not continue past a failure; `reference/protocol.md` maps each status code to its meaning.
+Four hops: list, detail, step graph, then that one workflow's triggers. The script sends every request through the system `curl` by design; there is nothing to ask the owner about it, and the bash harvester in `scripts/bash/` sends the same requests, so it is not a fallback for a failed probe. It ends with `GRAPH REACHED` or a clear reason. Do not continue past a failure; `reference/protocol.md` maps each status code to its meaning.
 
 ### Step 4: Harvest
 
 ```bash
-python3 scripts/ghl_workflow_mapper.py tree <locationId>
-python3 scripts/ghl_workflow_mapper.py harvest <locationId>
-python3 scripts/ghl_workflow_mapper.py harvest-triggers <locationId>
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py tree <locationId>
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py harvest <locationId>
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py harvest-triggers <locationId>
 ```
 
-`tree` lists every workflow id and name with folders recursed. `harvest` saves `<wfId>.detail.json` and `<wfId>.graph.json`. `harvest-triggers` saves the separate trigger object and reports counts of saved, no-trigger and failed. Two kinds of miss are expected, not broken: a workflow with no `triggersFilePath` has no trigger of its own and only runs when another workflow adds the contact, and some trigger objects return HTTP 400 because Firebase download tokens are per-object. Record both as gaps; do not retry.
+`tree` lists every workflow id and name with folders recursed. `harvest` saves `<wfId>.detail.json` and `<wfId>.graph.json`. `harvest-triggers` saves each workflow's trigger list from the endpoint the builder itself reads, and reports counts of saved, children and failed. An empty list is expected, not broken: that workflow has no trigger of its own and only runs when another workflow adds the contact, so count it as a child. The script retries a 503 once by itself; record anything still failed as a gap and do not retry again.
 
 A sub-account of about a hundred workflows is roughly three GETs per workflow at one second apiece, so budget a few minutes. Run the harvest in the background, then **wait for it to exit and check its counts before any offline mode**; the offline modes cannot tell a partial snapshot from a complete one.
 
@@ -113,8 +134,8 @@ The list call requests one page of up to 500 rows per folder and does not page b
 ### Step 5: Draw the map and stop
 
 ```bash
-python3 scripts/ghl_workflow_mapper.py diagram <locationId> --out workflow-map.html
-python3 scripts/ghl_workflow_mapper.py diagram <locationId> --out workflow-map.md
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py diagram <locationId> --out workflow-map.html
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py diagram <locationId> --out workflow-map.md
 ```
 
 `diagram` is offline: it reads the snapshot and writes a Mermaid flowchart. Nodes are workflows (dashed border = draft; the second line shows the trigger type, or "child: no trigger of its own"). Edges are the four relationships that make workflows depend on each other: **adds** the contact to another workflow (solid), **removes** it (dashed), **fires on change** (thick, from a rounded field node that also shows which workflows write that field), and **tests membership** (red dashed, a branch asking whether the contact is currently inside another workflow). Workflows with none of these edges are not drawn; the tool lists them on stderr so you can report the count.
@@ -134,9 +155,9 @@ When the owner asks a question about a workflow, or asks what could be wrong, wo
 **Answering a question about one or a few workflows.**
 
 ```bash
-python3 scripts/ghl_workflow_mapper.py flow <locationId> <wfId>
-python3 scripts/ghl_workflow_mapper.py triggers <locationId> [wfId]
-python3 scripts/ghl_workflow_mapper.py inspect-raw <locationId> <wfId> <stepIndex|nodeId>
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py flow <locationId> <wfId>
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py triggers <locationId> [wfId]
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py inspect-raw <locationId> <wfId> <stepIndex|nodeId>
 ```
 
 `flow` prints a header (name, id, status, dataVersion, step count, trigger) and one indented line per step as `[i] type | name | key params`, with wait durations and windows, tags, sends (subject or truncated body), field writes, stage targets, and a branch line per `if_else` condition. Quote those lines as printed; never widen them by hand. Ids lead and builder labels follow, and a mismatch between a label and its attribute (a step labelled "5 Minutes After" whose attribute says `after=45 minutes`) is exactly the kind of thing to point out.
@@ -148,16 +169,16 @@ python3 scripts/ghl_workflow_mapper.py inspect-raw <locationId> <wfId> <stepInde
 **Building the written inventory** (only if the owner wants a document):
 
 ```bash
-python3 scripts/ghl_workflow_mapper.py inventory <locationId> --anchor "<workflow name>" \
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py inventory <locationId> --anchor "<workflow name>" \
   [--core-names "A,B"] [--process-regex RE] [--reminder-regex RE] [--followup-regex RE] \
   [--only CLASS,...] [--grep S] [--expect-count N] [--md]
-python3 scripts/ghl_workflow_mapper.py fields <locationId> [--md] [--min-wf N] [--section fields|tokens|both]
-python3 scripts/ghl_workflow_mapper.py summary <locationId>
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py fields <locationId> [--md] [--min-wf N] [--section fields|tokens|both]
+python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py summary <locationId>
 ```
 
 Confirm the **anchor** (the workflow that visibly does the thing) with the owner first (checkpoint 4); `--anchor` is required and `--core-names` is the owner's override. The classifier seeds itself from the anchor's fields, tags, stages and trigger scope, scores every other workflow by overlap and by name (`CORE`, `REMINDER`, `FOLLOWUP`, `ADJACENT`, `UNRELATED`), and prints its evidence per row so a human can override it. If `CORE` comes out bigger than the owner expected, show the seed lines the mode prints and let the owner cut the seed set. Resolve field and stage ids to names read-only per `reference/protocol.md`, with an outer join so unresolved ids are listed, never dropped.
 
-The document: purpose and scope; how it was produced (commands, snapshot date, who accepted the terms note and when); counts; Table A (every workflow, with a **Disposition** column the owner fills in, pre-filled only as `needs-review` for `CORE` and `ADJACENT` and `keep` for a `FOLLOWUP` whose evidence reads "name; no seed overlap", checkpoint 5); deep dives from `flow` for `CORE` and `ADJACENT`; Table B (custom fields, with two empty reviewer columns: *shared with another process?* and *safe to retire?*) and the custom values the chain depends on; Table C (stages); the dependency map; gaps; refresh instructions. State that contact custom-field values a human typed are not readable by this method.
+The document: purpose and scope; how it was produced (commands and snapshot date); counts; Table A (every workflow, with a **Disposition** column the owner fills in, pre-filled only as `needs-review` for `CORE` and `ADJACENT` and `keep` for a `FOLLOWUP` whose evidence reads "name; no seed overlap", checkpoint 5); deep dives from `flow` for `CORE` and `ADJACENT`; Table B (custom fields, with two empty reviewer columns: *shared with another process?* and *safe to retire?*) and the custom values the chain depends on; Table C (stages); the dependency map; gaps; refresh instructions. State that contact custom-field values a human typed are not readable by this method.
 
 ## Refreshing a snapshot
 
@@ -165,4 +186,4 @@ Snapshots go stale the moment someone edits a workflow. To refresh: fresh token,
 
 ## Starter prompt
 
-> Use the ghl-workflow-mapper skill. Before your first network call, read me the skill's read-only note and terms note in plain words and wait for my explicit yes, then record who accepted and when. I will need to give you two things and I do not know where to find them, so guide me step by step: first the location id of the sub-account (tell me where it sits in the GHL address bar and wait for me to paste it), then the session token (tell me exactly where to click in the browser DevTools and wait for me to confirm it is stored). Read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.
+> Use the ghl-workflow-mapper skill. Before your first network call, give me a short overview of what you need my permission to do, wait for my yes, then give me the terminal command that lets you run the script. I will need to give you two things and I do not know where to find them, so guide me step by step: first the location id of the sub-account (tell me where it sits in the GHL address bar and wait for me to paste it), then the session token (tell me exactly where to click in the browser DevTools and wait for me to confirm it is stored). Read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.

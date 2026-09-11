@@ -21,7 +21,7 @@ Check every workflow in your CORE and ADJACENT set against each pattern below be
 
 **Status is not stage.** `create_opportunity` without `pipeline_stage_id` sets `won` or `open` and a monetary value but moves nothing. Never read `status` as a stage signal.
 
-**Children have no trigger.** Workflows entered only by `add_to_workflow` have no `triggersFilePath`. Find their parents through the parents' `add_to_workflow` steps.
+**Children have no trigger.** Workflows entered only by `add_to_workflow` come back from the trigger endpoint as an empty list. Find their parents through the parents' `add_to_workflow` steps.
 
 **Tags nobody inside GHL reads.** Tags set and removed by workflows but tested by none are being consumed outside GHL: reporting, Zapier, Make, spreadsheets. Find the external readers before recommending that anyone drop them.
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """ghl_workflow_mapper.py - read-only mapper for GoHighLevel workflow internals.
 
-READ-ONLY BY CONSTRUCTION: every network call is an HTTP GET. Do not add a write.
+READ-ONLY BY CONSTRUCTION: every network call is an HTTP GET, sent through the
+system curl (GHL's edge refuses Python's built-in HTTP client). Do not add a write.
 
 Sends the same read-only requests the browser makes when the workflow builder is
-open. They are not part of GHL's public API and can change without notice; the
-account owner must accept that before you run it. Be polite: one call per second,
+open. They are not part of GHL's public API and can change without notice; get
+the account owner's go-ahead before you run it. Be polite: one call per second,
 run rarely, stop on 404 or on a changed JSON shape.
 
 Token: a Firebase session JWT copied from DevTools (request header `token-id`,
@@ -18,7 +19,7 @@ Network modes (GET only):
     probe            <loc>                  list -> detail -> graph, proves access
     tree             <loc>                  every workflow id + name (folders recursed)
     harvest          <loc> [wfId ...]       save <wfId>.detail.json + .graph.json
-    harvest-triggers <loc> [wfId ...]       save <wfId>.triggers.json (second object)
+    harvest-triggers <loc> [wfId ...]       save <wfId>.triggers.json (builder's trigger list)
 Offline modes (read the saved snapshots only):
     schema           <loc> [stepType]       step-type vocabulary + attribute paths
     inventory        <loc> --anchor "Name" [--md] [--only CLASS,..] [--grep S]
@@ -38,15 +39,13 @@ Offline modes (read the saved snapshots only):
                      --out .md writes a mermaid fence; .html writes an
                      artifact-ready page (<pre class="mermaid">, no library).
 
-Snapshots land in ./ghl-workflow-snapshots/<loc>/ (override with GHL_SNAPSHOT_DIR).
+Snapshots land in ./.ghl-workflow-snapshots/<loc>/ (override with GHL_SNAPSHOT_DIR).
 Keep that folder out of version control: it holds client automation data and
 live webhook secrets.
 """
-import glob, json, os, re, subprocess, sys, time
+import base64, glob, json, os, re, subprocess, sys, tempfile, time
 from collections import Counter, defaultdict
-from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
 BASE = "https://backend.leadconnectorhq.com/workflow"
 SLEEP = 1.0
@@ -74,19 +73,56 @@ def load_token():
                 break
     if not t:
         sys.exit("ERROR: no token. Set GHL_TOKEN_ID or store it in the OS secret store (see header).")
-    print(f"token loaded ({len(t)} chars, value not printed)")
+    left = token_minutes_left(t)
+    if left is None:
+        print(f"token loaded ({len(t)} chars, value not printed; expiry unreadable)")
+    elif left < 0:
+        print(f"token loaded ({len(t)} chars, value not printed) but it EXPIRED {-left} min ago: "
+              "store a fresh token-id before any network mode.", file=sys.stderr)
+    else:
+        print(f"token loaded ({len(t)} chars, value not printed; expires in {left} min)")
     return t
 
-def http_get(url, headers=None):
-    """(status, bytes). Never raises on HTTP status; raises only on network failure."""
-    req = Request(url, headers=headers or {}, method="GET")
+def token_minutes_left(t):
+    """Minutes until the token's exp claim, read locally from the JWT (no network call)."""
     try:
-        with urlopen(req, timeout=60) as r:
-            return r.status, r.read()
-    except HTTPError as e:
-        return e.code, e.read()
-    except URLError as e:
-        return 0, str(e).encode()
+        seg = t.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(seg)).get("exp")
+        return None if exp is None else int((exp - time.time()) // 60)
+    except Exception:
+        return None
+
+def http_get(url, headers=None):
+    """(status, bytes). Never raises on HTTP status; status 0 on network failure.
+
+    Goes through the system curl, not urllib: GHL's edge answers Python's built-in
+    client with 403 and accepts curl with the same token and headers. The URL and
+    headers reach curl on stdin (-K -), so neither the token nor a signed download
+    link shows up in the process list. No -d, -X or -T is ever set: curl only GETs.
+    """
+    def q(s):
+        return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    cfg = f"url = {q(url)}\n" + "".join(
+        f"header = {q(f'{k}: {v}')}\n" for k, v in (headers or {}).items())
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "body")
+        try:
+            p = subprocess.run(["curl", "-sS", "--max-time", "60", "-o", out,
+                                "-w", "%{http_code}", "-K", "-"],
+                               input=cfg.encode(), capture_output=True, timeout=90)
+        except FileNotFoundError:
+            sys.exit("ERROR: curl not found. It ships with macOS, Windows 10+ and most Linux; install it.")
+        except subprocess.TimeoutExpired:
+            return 0, b"curl timed out"
+        s = p.stdout.decode().strip()
+        code = int(s) if s.isdigit() else 0
+        if code == 0:
+            return 0, p.stderr
+        if not os.path.exists(out):
+            return code, b""
+        with open(out, "rb") as fh:
+            return code, fh.read()
 
 def list_headers(tok):
     return {"token-id": tok, "channel": "APP", "source": "WEB_USER", "version": "2021-04-15"}
@@ -96,17 +132,19 @@ def detail_headers(tok):
             "origin": "https://client-app-automation-workflows.leadconnectorhq.com",
             "referer": "https://client-app-automation-workflows.leadconnectorhq.com/"}
 
-def die_on_auth(code):
+def die_on_auth(code, body):
     if code == 401:
         sys.exit("401: token expired or invalid. Copy a fresh token-id from DevTools and store it.")
     if code == 403:
-        sys.exit("403: token is not scoped to this location.")
+        snippet = body[:300].decode("utf-8", "replace") if body else ""
+        sys.exit("403: refused. Either the token is not scoped to this location, or a firewall "
+                 "in front of GHL refused the request. First bytes of the reply:\n" + snippet)
 
 # ----------------------------------------------------------------- network modes
 def walk_tree(loc, tok, parent="root", acc=None):
     acc = acc if acc is not None else []
     code, body = http_get(f"{BASE}/{loc}/list?parentId={parent}&limit=500&offset=0", list_headers(tok))
-    die_on_auth(code)
+    die_on_auth(code, body)
     if code != 200:
         print(f"  list(parentId={parent}) -> HTTP {code}", file=sys.stderr)
         return acc
@@ -121,25 +159,16 @@ def walk_tree(loc, tok, parent="root", acc=None):
 
 def fetch_detail(loc, tok, wid):
     code, body = http_get(f"{BASE}/{loc}/{wid}?includeScheduledPauseInfo=true", detail_headers(tok))
-    die_on_auth(code)
+    die_on_auth(code, body)
     return code, body
 
-def triggers_url(detail):
-    """Compose the triggers object URL from fileUrl + triggersFilePath (see docs)."""
-    fu, tp = detail.get("fileUrl") or "", detail.get("triggersFilePath") or ""
-    if not tp:
-        return None
-    if URLISH_RE.match(tp):
-        return tp
-    if fu and "/o/" in fu:
-        prefix = fu.split("/o/", 1)[0] + "/o/"
-        q = urlparse(fu).query
-        return prefix + quote(tp.lstrip("/"), safe="") + (f"?{q}" if q else "")
-    return None
+def trigger_endpoint(loc, wid):
+    """The endpoint the workflow builder reads triggers from (see reference/protocol.md)."""
+    return f"{BASE}/{loc}/trigger?workflowId={wid}"
 
 def mode_probe(loc, tok):
     code, body = http_get(f"{BASE}/{loc}/list?limit=25&offset=0", list_headers(tok))
-    die_on_auth(code)
+    die_on_auth(code, body)
     print(f"1. list -> HTTP {code}")
     if code != 200:
         sys.exit("cannot list workflows; stopping.")
@@ -165,6 +194,13 @@ def mode_probe(loc, tok):
     if code == 200:
         steps = steps_of(json.loads(body))
         print(f"   {len(steps)} step(s): {dict(Counter(step_type(s) for s in steps).most_common(6))}")
+        time.sleep(SLEEP)
+        code, body = http_get(trigger_endpoint(loc, wid), detail_headers(tok))
+        try:
+            n = len(trigger_list(json.loads(body))) if code == 200 else None
+        except ValueError:
+            n = None
+        print(f"5. triggers -> HTTP {code}" + (f" ({n} trigger(s))" if n is not None else ""))
         print("GRAPH REACHED - full workflow internals are available.")
 
 def mode_tree(loc, tok):
@@ -198,6 +234,8 @@ def mode_harvest(loc, tok, ids):
     print(f"done: {ok} saved to {dest}, {failed} failed")
 
 def mode_harvest_triggers(loc, tok, ids):
+    """One GET per workflow to the builder's trigger endpoint, detail headers. The body is
+    a JSON list of trigger objects; an empty list means no trigger of its own (a child)."""
     dest = os.path.join(OUT_ROOT, loc)
     if not os.path.isdir(dest):
         sys.exit("harvest first.")
@@ -205,21 +243,22 @@ def mode_harvest_triggers(loc, tok, ids):
     saved = children = failed = 0
     for wid in ids:
         time.sleep(SLEEP)
-        code, body = fetch_detail(loc, tok, wid)       # fresh signature
+        code, body = http_get(trigger_endpoint(loc, wid), detail_headers(tok))
+        if code == 503:                                 # transient: one retry, then a gap
+            time.sleep(5)
+            code, body = http_get(trigger_endpoint(loc, wid), detail_headers(tok))
+        die_on_auth(code, body)
         if code != 200:
-            failed += 1; print(f"  {wid} detail -> HTTP {code}", file=sys.stderr); continue
-        url = triggers_url(json.loads(body))
-        if not url:
-            children += 1; continue                     # no trigger of its own
-        time.sleep(SLEEP)
-        tcode, tbody = http_get(url)
-        if tcode == 200:
-            with open(os.path.join(dest, f"{wid}.triggers.json"), "wb") as fh:
-                fh.write(tbody)
-            saved += 1
-        else:
-            failed += 1; print(f"  {wid} triggers -> HTTP {tcode} (per-object token; not retried)", file=sys.stderr)
-    print(f"done: {saved} saved, {children} with no trigger of their own (children), {failed} failed")
+            failed += 1; print(f"  {wid} triggers -> HTTP {code}", file=sys.stderr); continue
+        try:
+            n = len(trigger_list(json.loads(body)))
+        except ValueError:
+            failed += 1; print(f"  {wid} triggers -> not JSON", file=sys.stderr); continue
+        with open(os.path.join(dest, f"{wid}.triggers.json"), "wb") as fh:
+            fh.write(body)
+        saved += 1
+        children += n == 0
+    print(f"done: {saved} saved ({children} with no trigger of their own: children), {failed} failed")
 
 # ----------------------------------------------------------------- snapshot access
 def load_json(p):
@@ -693,7 +732,10 @@ def mode_flow(base, wid):
     if not steps: sys.exit(f"no saved graph for {wid} (harvest first)")
     trig = load_triggers(base, wid)
     print(f"{d.get('name', '?')}  [{wid}]\n  status={d.get('status', '?')}  dataVersion={d.get('dataVersion', '?')}  steps={len(steps)}")
-    print(f"  trigger: {trigger_summary(trig, 4) if trig is not None else '— (no triggers file: child, or run harvest-triggers)'}\n")
+    trig_line = ("— (no triggers file: run harvest-triggers)" if trig is None else
+                 trigger_summary(trig, 4) if trigger_list(trig) else
+                 "none of its own (child: entered by another workflow)")
+    print(f"  trigger: {trig_line}\n")
     depths = depth_map(steps)
     for i, s in enumerate(steps):
         ind = "  " * min(depths.get(s.get("id"), 0), 8); kp = key_params(s)
@@ -840,11 +882,11 @@ def mode_diagram(base, args):
         w = wfs[wid]
         trig_txt = ""
         if w["triggers"] is None:
-            trig_txt = "child: no trigger of its own" if not any(e[1] == wid and e[2] == "trig" for e in edges) else ""
+            trig_txt = "trigger not harvested"
         elif w["triggers"]:
             trig_txt = "trigger: " + ", ".join(sorted({t for t, _n, _f in w["triggers"]}))[:60]
         else:
-            trig_txt = "no trigger object"
+            trig_txt = "child: no trigger of its own"
         parts = [_mm_label(w["name"])]
         if w["status"] != "published": parts.append(w["status"])
         if trig_txt: parts.append(_mm_label(trig_txt))

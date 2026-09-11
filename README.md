@@ -17,7 +17,7 @@ Read-only by construction: every network call the tool makes is an HTTP GET. It 
 | Environment | Status | Why |
 |---|---|---|
 | **Claude Code** (CLI, or the Code tab in the Claude desktop app) | Supported | Local shell and Python, macOS keychain for the token, local snapshot files, diagram published as an artifact. If you have the Bash sandbox enabled, allowlist `backend.leadconnectorhq.com` and `firebasestorage.googleapis.com` and exclude the `security` command. |
-| Other coding agents with a shell and Python 3.8+ (Cursor, Codex CLI, and similar) | Should work | Same requirements. The diagram is written as a Markdown file with a Mermaid fence, which renders in GitHub, VS Code, Obsidian and Notion. |
+| Other coding agents with a shell, Python 3.8+ and curl (Cursor, Codex CLI, and similar) | Should work | Same requirements. The diagram is written as a Markdown file with a Mermaid fence, which renders in GitHub, VS Code, Obsidian and Notion. |
 
 ## Install
 
@@ -27,7 +27,7 @@ From the root of the folder you want to work in (a scratch repo is fine):
 curl -fsSL https://raw.githubusercontent.com/mb0390231ai/ghl-workflow-mapper/main/install.sh | bash
 ```
 
-or copy the four files by hand into `.claude/skills/ghl-workflow-mapper/`:
+or copy the files by hand into `.claude/skills/ghl-workflow-mapper/`. The skill needs the first four; `scripts/bash/` is the optional bash harvester (see "What is in the tool" below).
 
 ```
 .claude/skills/ghl-workflow-mapper/
@@ -36,28 +36,54 @@ or copy the four files by hand into `.claude/skills/ghl-workflow-mapper/`:
 │   ├── protocol.md
 │   └── pitfalls.md
 └── scripts/
-    └── ghl_workflow_mapper.py
+    ├── ghl_workflow_mapper.py
+    └── bash/                      (optional)
+        ├── harvest_workflows.sh
+        └── wf_lib.py
 ```
 
 Then add `.ghl-workflow-snapshots/` to that folder's `.gitignore`. The snapshots hold your clients' automation definitions and, inside webhook steps, live API keys.
+
+### Let Claude Code run the script
+
+Claude Code's permission system can block the script even after you say yes to the agent, because the script sends your session token over the network, and the agent cannot give itself permission. Right after you say yes, the agent gives you this command to run in your own terminal. It is here for reference; run it from the same folder:
+
+```bash
+python3 - <<'PY'
+import json, os
+p = ".claude/settings.local.json"
+s = json.load(open(p)) if os.path.exists(p) else {}
+allow = s.setdefault("permissions", {}).setdefault("allow", [])
+for r in ("Bash(python3 .claude/skills/ghl-workflow-mapper/scripts/ghl_workflow_mapper.py:*)",
+          "Bash(bash .claude/skills/ghl-workflow-mapper/scripts/bash/harvest_workflows.sh:*)"):
+    if r not in allow:
+        allow.append(r)
+os.makedirs(".claude", exist_ok=True)
+with open(p, "w") as f:
+    json.dump(s, f, indent=2)
+print("allowed the ghl-workflow-mapper scripts in", p)
+PY
+```
+
+The rules cover only these two scripts in this folder. To remove them later, delete the two lines containing `ghl-workflow-mapper` from `.claude/settings.local.json`.
 
 ## Starter prompt
 
 Open Claude Code in that folder and paste:
 
-> Use the ghl-workflow-mapper skill. Before your first network call, read me the skill's read-only note and terms note in plain words and wait for my explicit yes, then record who accepted and when. I will need to give you two things and I do not know where to find them, so guide me step by step: first the location id of the sub-account (tell me where it sits in the GHL address bar and wait for me to paste it), then the session token (tell me exactly where to click in the browser DevTools and wait for me to confirm it is stored). Read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.
+> Use the ghl-workflow-mapper skill. Before your first network call, give me a short overview of what you need my permission to do, wait for my yes, then give me the terminal command that lets you run the script. I will need to give you two things and I do not know where to find them, so guide me step by step: first the location id of the sub-account (tell me where it sits in the GHL address bar and wait for me to paste it), then the session token (tell me exactly where to click in the browser DevTools and wait for me to confirm it is stored). Read no other location without asking me first. Produce the dependency diagram of the whole account and stop there. I will ask questions or request an audit afterwards.
 
 The agent will explain what it is about to do and what it needs from you (the sub-account's location id from the address bar, and about two minutes in your browser's DevTools to copy a session token from a request to backend.leadconnectorhq.com, which expires after an hour), download the workflow definitions, and show you the diagram. After that, ask it anything: "what does the Booking Confirmation workflow actually do", "which workflows would break if I disabled this one", "audit these for hidden problems".
 
 ## Before you run it
 
-- The requests are the ones GoHighLevel's own web app sends when you open the builder. They are not part of GHL's public API, GHL can change them without notice, and you should check that this use is acceptable under your own agreement with GoHighLevel. The skill makes the agent stop and ask you before the first call.
+- The requests are the ones GoHighLevel's own web app sends when you open the builder. They are not part of GHL's public API, and GHL can change them without notice. Before the first call, the agent tells you what it needs permission to do and waits for your go-ahead.
 - The token is agency-level. One copy reads every sub-account your login can see. The skill stores it in your OS secret store and never prints it; do not paste it into chat.
 - One call per second, run rarely. Bursting these endpoints is how an agency gets noticed and blocked.
 
 ## What is in the tool
 
-`scripts/ghl_workflow_mapper.py`, Python 3.8+, standard library only. Modes: `probe`, `tree`, `harvest`, `harvest-triggers` (network, GET only) and `diagram`, `schema`, `flow`, `triggers`, `inspect-raw`, `inventory`, `fields`, `summary` (offline, against the saved snapshot). Run it with no arguments for usage.
+`scripts/ghl_workflow_mapper.py`, Python 3.8+ with the system `curl` (preinstalled on macOS, Windows 10+ and most Linux), no packages. Modes: `probe`, `tree`, `harvest`, `harvest-triggers` (network, GET only) and `diagram`, `schema`, `flow`, `triggers`, `inspect-raw`, `inventory`, `fields`, `summary` (offline, against the saved snapshot). Run it with no arguments for usage.
 
 `scripts/bash/harvest_workflows.sh` with `scripts/bash/wf_lib.py` is the original bash implementation (bash 3.2 compatible, curl plus inline Python heredocs). Same read-only protocol, same snapshot layout, same offline modes minus `diagram`, plus `inspect` and `inspect-full` for diffing one location's copy of a workflow against the template it was cloned from. The Python tool supersedes it; it is kept for people who prefer bash. Run it with no arguments for usage.
 

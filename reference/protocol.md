@@ -5,7 +5,7 @@ Read this when a call fails, when the JSON shape looks new, or when you are addi
 ## Contents
 
 - The three hops (list, detail, step graph)
-- Triggers are a separate object
+- Triggers come from their own endpoint
 - Failure semantics
 - Politeness and runtime
 - Step vocabulary: where the key facts live
@@ -38,7 +38,7 @@ Headers: `authorization: Bearer <same token>`, `channel: APP`, `source: WEB_USER
 
 The list endpoint wants the token in `token-id`; the detail endpoint wants it as `Bearer`. Same value, different header. This is the single most common cause of a 401 on a token that is actually fine.
 
-Response fields you need: `name`, `status` (published or draft), `dataVersion`, `fileUrl` (a signed Firebase Storage URL holding the step graph), and sometimes `triggersFilePath`.
+Response fields you need: `name`, `status` (published or draft), `dataVersion`, `fileUrl` (a signed Firebase Storage URL holding the step graph). `triggersFilePath` and `isTriggerBucketMigrated` may also appear; ignore them and read triggers from their own endpoint (next section).
 
 **Hop 3, the step graph.**
 
@@ -48,41 +48,33 @@ GET <fileUrl>
 
 No auth header: the URL is already signed. The body is JSON with `steps[]`. Save it as `<workflowId>.graph.json` next to `<workflowId>.detail.json`.
 
-## Triggers are a separate object
+## Triggers come from their own endpoint
 
-`triggersFilePath` is the **unencoded** object path in the same Firebase bucket. Build its URL from `fileUrl`: keep everything up to and including `/o/`, append the triggers path percent-encoded as one segment, and reuse `fileUrl`'s query string.
+The workflow builder reads a workflow's triggers straight from GHL's server, not from a stored file:
 
-<example>
-Given, from the detail response:
+```
+GET https://backend.leadconnectorhq.com/workflow/{locationId}/trigger?workflowId={workflowId}
+```
 
-    fileUrl           = https://<storage-host>/v0/b/<bucket>/o/<encoded-graph-path>?alt=media&token=<t>
-    triggersFilePath  = locations/<locationId>/workflows/<workflowId>/triggers.json
+Headers: the same as the detail hop (`authorization: Bearer <same token>`, `channel`, `source`, `origin`, `referer`). The body is a JSON list of trigger objects; save it as `<workflowId>.triggers.json`.
 
-Build:
+An **empty list** means the workflow has no trigger of its own. It only ever runs when another workflow's `add_to_workflow` step adds the contact, so it is a child, not a gap: find its parents by searching the harvested graphs for that `workflow_id`.
 
-    https://<storage-host>/v0/b/<bucket>/o/locations%2F<locationId>%2Fworkflows%2F<workflowId>%2Ftriggers.json?alt=media&token=<t>
-
-Keep the prefix through `/o/`, percent-encode the whole triggers path as one segment (every `/` becomes `%2F`), and reuse the query string unchanged.
-</example>
-
-Two kinds of miss are normal and should be recorded as gaps rather than retried:
-
-- A workflow with **no** `triggersFilePath` has no trigger of its own. It is only ever entered by another workflow's `add_to_workflow` step. Find its parents by searching the harvested graphs for that `workflow_id`.
-- Some trigger objects return **HTTP 400** because Firebase download tokens are per-object, meaning the token on `fileUrl` is scoped to the graph object only.
+Do not build a download link from `triggersFilePath`. Earlier versions of this tool did, reusing `fileUrl`'s signed query; GHL has since moved trigger storage (detail responses carry `isTriggerBucketMigrated: true`), and those links now return 400 or 404. The endpoint above was found in September 2026 by opening a workflow in the builder with the DevTools Network tab filtered on `trigger`. If it stops working, capture the builder's request the same way and report the difference; do not guess.
 
 ### What a trigger object holds
 
-A contact-field-change trigger has `type: contact_changed` and `conditions[]` entries with `id` (the custom-field id), `field` (`contact.<fieldId>`), `title`, `operator` (`has-changed`) and the workflow it starts under `actions[].workflow_id`. Other trigger types (`appointment`, `form_submission`, `customer_appointment`, `contact_tag`, `opportunity_status_changed`, `pipeline_stage_updated`, `customer_reply`, `call_status`) carry their filters in the same `conditions[]` shape. The `diagram` mode uses `contact_changed` triggers to draw "workflow A writes field F, F fires workflow B".
+Each object carries `id`, `name`, `type`, `active`, `workflow_id`, `masterType`, `conditions[]` and `actions[]`. A contact-field-change trigger has `type: contact_changed` and `conditions[]` entries with `id` (the custom-field id), `field` (`contact.<fieldId>`), `title`, `operator` (`has-changed`) and the workflow it starts under `actions[].workflow_id`. Other trigger types (`appointment`, `form_submission`, `customer_appointment`, `contact_tag`, `opportunity_status_changed`, `pipeline_stage_updated`, `customer_reply`, `call_status`, `opportunity_decay`) carry their filters in the same `conditions[]` shape; some, such as `facebook_lead_gen`, carry none. The `diagram` mode uses `contact_changed` triggers to draw "workflow A writes field F, F fires workflow B".
 
 ## Failure semantics
 
 | Status | Meaning | Action |
 |---|---|---|
 | 401 | Token expired or invalid (the JWT lasts about an hour) | Ask for a fresh `token-id` and store it. That is almost always the answer; if a fresh token also 401s, stop and check the header form (`token-id` on the list hop, `authorization: Bearer` on the detail hop) |
-| 403 | Token is not scoped to that location | Confirm the location id and the user's access |
+| 403 | Token is not scoped to that location, or GHL's edge refused the HTTP client (it refuses Python's built-in client, which is why the script sends through curl) | Read the first bytes of the reply the script prints, then confirm the location id and the user's access. Do not retry with a different client or different headers |
 | 404 on a single workflow id | The workflow was deleted after you listed it | Record it as a gap, do not retry it, carry on with the rest of the harvest |
 | 404 on the list or detail endpoint for a location that worked minutes ago, or a changed JSON shape | GHL moved something | Stop the run and report the request path plus what came back instead. Do not retry in a loop |
-| 503 | Transient | Note it and move on |
+| 503 | Transient | `harvest-triggers` waits and retries that one request once by itself. Anywhere else, rerun that one workflow id once; if it fails again, record a gap and move on |
 
 **What counts as a changed JSON shape.** Treat the shape as changed when a field this file says you need is absent: `rows[]` with `type` / `id` / `name` on the list hop, or `name` / `status` / `fileUrl` on the detail hop. A missing `triggersFilePath` or `dataVersion` is normal, and is a gap rather than a shape change.
 

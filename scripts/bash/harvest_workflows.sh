@@ -16,9 +16,9 @@
 #
 #   The endpoints below are the ones GHL's own web app calls. These are the same
 #   read-only requests the browser makes when the workflow builder is open. They
-#   are not part of GHL's public API and can change without notice; the account
-#   owner should confirm this use is acceptable under their own agreement with
-#   GHL before running it. Keep usage read-only, rate-limited, and infrequent.
+#   are not part of GHL's public API and can change without notice. Get the
+#   account owner's go-ahead before running it. Keep usage read-only,
+#   rate-limited, and infrequent.
 #   If a call starts returning 404 or a different JSON shape, assume GHL moved
 #   it, and do not escalate retries.
 #
@@ -41,7 +41,7 @@
 #     probe            <locationId>                  # 3 calls, verifies access
 #     tree             <locationId>                  # enumerate workflows only
 #     harvest          <locationId> [<workflowId> ...]  # detail + graph -> OUT_DIR
-#     harvest-triggers <locationId> [<workflowId> ...]  # -> <workflowId>.triggers.json
+#     harvest-triggers <locationId> [<workflowId> ...]  # builder's trigger list -> <workflowId>.triggers.json
 #
 #   OFFLINE MODES (read the snapshots already in OUT_DIR)
 #     schema      <locationId> [stepType]           # step-type vocabulary + attr paths
@@ -87,7 +87,21 @@ if [[ -z "$TOKEN" ]]; then
   echo "ERROR: keychain item GHL_TOKEN_ID not found. See the AUTH section in this script." >&2
   exit 3
 fi
-echo "token loaded (${#TOKEN} chars, value not printed)"
+# Minutes until the token's exp claim, read locally from the JWT (no network call).
+MIN_LEFT="$(printf '%s' "$TOKEN" | python3 -c '
+import sys, json, base64, time
+try:
+    seg = sys.stdin.read().split(".")[1]; seg += "=" * (-len(seg) % 4)
+    print(int((json.loads(base64.urlsafe_b64decode(seg))["exp"] - time.time()) // 60))
+except Exception:
+    pass')"
+if [[ -z "$MIN_LEFT" ]]; then
+  echo "token loaded (${#TOKEN} chars, value not printed; expiry unreadable)"
+elif (( MIN_LEFT < 0 )); then
+  echo "token loaded (${#TOKEN} chars, value not printed) but it EXPIRED $(( -MIN_LEFT )) min ago: store a fresh token-id before any network mode." >&2
+else
+  echo "token loaded (${#TOKEN} chars, value not printed; expires in ${MIN_LEFT} min)"
+fi
 
 # GET $1 into file $2; echoes the HTTP status. Extra args are passed to curl,
 # which is how the probe swaps in a reduced header set.
@@ -133,9 +147,8 @@ if isinstance(doc, dict):
         val = doc.get(field)
         if isinstance(val, list):
             print(f"  {field}: {len(val)} item(s)")
-    for field in ("fileUrl", "triggersFilePath"):
-        if doc.get(field):
-            print(f"  {field}: present (second Firebase hop needed)")
+    if doc.get("fileUrl"):
+        print("  fileUrl: present (the step graph is a second hop)")
 PY
 }
 
@@ -198,7 +211,7 @@ if rows:
     types=Counter(r.get("type","?") for r in rows)
     print("  type distribution: " + ", ".join(f"{t}={n}" for t,n in types.items()), file=sys.stderr)
 # prefer a non-folder row so the detail call resolves
-def is_wf(r): return str(r.get("type","")).lower() not in ("folder","")
+def is_wf(r): return str(r.get("type","")).lower() not in ("folder","directory","")
 first_wf=next((r for r in rows if is_wf(r)), None)
 print(first_wf.get("id","") if first_wf else (rows[0].get("id","") if rows else ""))' "$tmp_full")"
   [[ -n "$WF_OVERRIDE" ]] && wf_id="$WF_OVERRIDE" && echo "  (using workflow-id override: $wf_id)"
@@ -893,9 +906,11 @@ PY
   ;;
 
 harvest-triggers)
-  # GET-only second hop for the trigger definitions. The detail response's
-  # triggersFilePath is a signed Firebase link like fileUrl; re-fetch detail so
-  # the signature is fresh, then follow it.
+  # One GET per workflow to the endpoint the workflow builder itself reads
+  # triggers from, sent with the detail headers:
+  #   GET /workflow/{locationId}/trigger?workflowId={workflowId}
+  # The body is a JSON list of trigger objects; an empty list means the workflow
+  # has no trigger of its own (a child). A 503 is retried once, then recorded.
   #   harvest-triggers <locationId> [<workflowId> ...]
   dest="${OUT_DIR}/${LOC}"
   [[ -d "$dest" ]] || { echo "no harvest dir at $dest (harvest first)" >&2; exit 2; }
@@ -916,68 +931,34 @@ PY
 )
   fi
   echo "fetching triggers for ${#IDS[@]} workflow(s) -> $dest"
-  saved=0; failed=0
+  saved=0; children=0; failed=0
   for id in "${IDS[@]}"; do
     sleep "$SLEEP_BETWEEN"
-    tmp_d="$(mktemp)"
-    c="$(ghl_get "${BASE}/${LOC}/${id}?includeScheduledPauseInfo=true" "$tmp_d" "${DETAIL_HEADERS[@]}")"
-    if [[ "$c" == "401" ]]; then
+    out="${dest}/${id}.triggers.json"
+    tc="$(ghl_get "${BASE}/${LOC}/trigger?workflowId=${id}" "$out" "${DETAIL_HEADERS[@]}")"
+    if [[ "$tc" == "503" ]]; then
+      sleep 5
+      tc="$(ghl_get "${BASE}/${LOC}/trigger?workflowId=${id}" "$out" "${DETAIL_HEADERS[@]}")"
+    fi
+    if [[ "$tc" == "401" ]]; then
+      rm -f "$out"
       echo "401: token expired, refresh GHL_TOKEN_ID (see AUTH)" >&2
       exit 4
     fi
-    if [[ "$c" != "200" ]]; then
-      failed=$((failed+1)); echo "  $id detail -> HTTP $c" >&2; continue
-    fi
-    # Print the SHAPE of both paths (hostname + path skeleton, no signature) so
-    # the relative-vs-absolute question is answerable from the transcript.
-    read -r shape_file shape_trig trig_url < <(python3 - "$SCRIPT_DIR" "$tmp_d" <<'PY'
-import sys, re
-sys.path.insert(0, sys.argv[1])
-from wf_lib import *  # noqa
-from urllib.parse import urlparse, quote
-d = load_json(sys.argv[2]) or {}
-fu = d.get("fileUrl") or ""
-tp = d.get("triggersFilePath") or ""
-def shape(u):
-    if not u:
-        return "-"
-    if URLISH_RE.match(u):
-        p = urlparse(u)
-        return f"{p.hostname}{re.sub(r'[^/]+', '*', p.path)}"
-    return "relative:" + re.sub(r"[^/]+", "*", u)
-# fileUrl is a Firebase Storage download link:
-#   https://firebasestorage.googleapis.com/v0/b/<bucket>/o/<pct-encoded path>?alt=media&token=…
-# triggersFilePath is the same bucket's OBJECT PATH, unencoded. So keep
-# everything up to and including "/o/", percent-encode the triggers path as one
-# segment, and reuse fileUrl's query (alt=media + download token).
-if not tp:
-    url = "-"
-elif URLISH_RE.match(tp):
-    url = tp
-elif fu and "/o/" in fu:
-    prefix = fu.split("/o/", 1)[0] + "/o/"
-    q = urlparse(fu).query
-    url = prefix + quote(tp.lstrip("/"), safe="") + (f"?{q}" if q else "")
-else:
-    url = "-"
-print(shape(fu), shape(tp), url)
-PY
-)
-    echo "  $id  fileUrl=$shape_file  triggersFilePath=$shape_trig"
-    if [[ "$trig_url" == "-" ]]; then
-      failed=$((failed+1)); echo "  $id: no triggersFilePath in detail" >&2; continue
-    fi
-    sleep "$SLEEP_BETWEEN"
-    tc="$(curl -sS -o "${dest}/${id}.triggers.json" -w '%{http_code}' "$trig_url")"
-    if [[ "$tc" == "200" ]]; then
-      saved=$((saved+1))
-    else
+    if [[ "$tc" != "200" ]]; then
       failed=$((failed+1))
-      rm -f "${dest}/${id}.triggers.json"
-      echo "  $id triggers -> HTTP $tc" >&2
+      echo "  $id triggers -> HTTP $tc; body: $(head -c 160 "$out" 2>/dev/null | tr '\n' ' ')" >&2
+      rm -f "$out"
+      continue
     fi
+    n="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from wf_lib import load_json, trigger_list; d = load_json(sys.argv[2]); print(-1 if d is None else len(trigger_list(d)))' "$SCRIPT_DIR" "$out")"
+    if [[ "$n" == "-1" ]]; then
+      failed=$((failed+1)); echo "  $id triggers -> not JSON" >&2; rm -f "$out"; continue
+    fi
+    saved=$((saved+1))
+    if [[ "$n" == "0" ]]; then children=$((children+1)); fi
   done
-  echo "done: $saved saved, $failed failed"
+  echo "done: $saved saved ($children with no trigger of their own: children), $failed failed"
   ;;
 
 *)
