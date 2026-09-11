@@ -59,6 +59,8 @@ The agent will explain what it is about to do and what it needs from you (the su
 
 `scripts/ghl_workflow_mapper.py`, Python 3.8+, standard library only. Modes: `probe`, `tree`, `harvest`, `harvest-triggers` (network, GET only) and `diagram`, `schema`, `flow`, `triggers`, `inspect-raw`, `inventory`, `fields`, `summary` (offline, against the saved snapshot). Run it with no arguments for usage.
 
+`scripts/bash/harvest_workflows.sh` with `scripts/bash/wf_lib.py` is the original bash implementation (bash 3.2 compatible, curl plus inline Python heredocs). Same read-only protocol, same snapshot layout, same offline modes minus `diagram`, plus `inspect` and `inspect-full` for diffing one location's copy of a workflow against the template it was cloned from. The Python tool supersedes it; it is kept for people who prefer bash. Run it with no arguments for usage.
+
 ## Example
 
 An invented but structurally typical result, so you can see what the map and the tables look like before you run anything: see the example page linked from wherever you found this skill.
